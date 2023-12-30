@@ -17,6 +17,9 @@ using point_t = std::tuple<double, double>;
 using map_t = std::unordered_map<int32_t, point_t>; 
 using heap_t = std::priority_queue<std::tuple<double, int32_t>, std::vector<std::tuple<double, int32_t>>, std::greater<std::tuple<double, int32_t>>>;
 
+/**
+ * @note this is a very bad way of doing this
+ */
 struct graph{
     graph_t g;
     map_t map;
@@ -34,7 +37,7 @@ std::tuple<double, double> h(const graph& g, int32_t s, int32_t e, int32_t v){
     double pi_r = sqrt((xs - xv) * (xs - xv) + (ys - yv) * (ys - yv));
     double pf = (pi_f - pi_r) * .5;
     double pr = -pf;
-    return {pf, pr};
+    return { pf, pr };
 }
 
 /**

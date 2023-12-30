@@ -35,7 +35,7 @@ inline constexpr double off_plus_excsc(double off, double r, double alpha){
  * this cannot happen) a nice workaround would be to approximate the object to it's oriented bounding box or convex hull
  */
 Clipper2Lib::PathsD offsetting::offset_env(const Clipper2Lib::PathsD& border, const Clipper2Lib::PathsD& ob, [[maybe_unused]] double robot_r, double min_r){
-    auto border_off = Clipper2Lib::InflatePaths(border, -min_r, Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
+    auto border_off = Clipper2Lib::InflatePaths(border, -min_r + .01, Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
     auto ob_off = Clipper2Lib::InflatePaths(ob, min_r, Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon, 2.1);
     Clipper2Lib::ClipperD cd;
     Clipper2Lib::PathsD p;

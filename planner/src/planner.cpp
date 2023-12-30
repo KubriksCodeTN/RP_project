@@ -10,6 +10,8 @@
 using std::placeholders::_1;
 
 #ifdef __DEBUG
+Clipper2Lib::PathD sample_arc(dubins::d_arc, uint_fast32_t);
+
 /**
  * @brief creates a dump to visualize the clipper enviroment on desmos
  */
@@ -33,6 +35,36 @@ void path_dump(auto path){
     }
     std::cout << "---------------------------------------------\n";
 }
+
+/**
+ * @brief creates a dump to visualize a dubins arc on desmos
+ */
+void arc_dump(auto path){
+    for (uint32_t i = 0U; i < path.size() - 1; ++i){
+        std::cout << "polygon((" << path[i].x << ", " << path[i].y << "), (";
+        std::cout << path[i + 1].x << ", " << path[i + 1].y << "))\n";
+    }
+    std::cout << "---------------------------------------------\n";
+}
+
+
+/**
+ * @brief creates a dump to visualize the dubins shortest path on desmos
+ */
+void dubins_dump(const auto& dpath){
+    for (const auto& c : dpath){
+        arc_dump(sample_arc(c.a1));
+        arc_dump(sample_arc(c.a2));
+        arc_dump(sample_arc(c.a3));
+    }
+    std::cout << "---------------------------------------------\n";
+}
+#else
+
+#define desmos_dump(x)
+#define path_dump(x)
+#define dubins_dump(x)
+
 #endif
 
 /**
@@ -68,17 +100,20 @@ inline Clipper2Lib::PointD circline(double x, double y, double th, double s, dou
 }
 
 /**
- * @brief sample a dubins arc to check intersections using clipper2
+ * @brief sample a dubins arc
+ * 
+ * @param arc the dubins arc to sample
+ * @param n_samples number of samples needed. 
+ *      "How can it be this fast!?" 
+ *      "It just is."
  */
-Clipper2Lib::PathD sample_arc(dubins::d_arc arc){
-    static constexpr uint_fast32_t n_samples = 30; // should always be good enough
-    Clipper2Lib::PathD v{ n_samples };
+Clipper2Lib::PathD sample_arc(dubins::d_arc arc, uint_fast32_t n_samples = 4){
+    Clipper2Lib::PathD v{ n_samples + 1 };
 
-    std::for_each(std::execution::par_unseq, v.begin(), v.end(), [=](auto& p){
-        for (uint32_t i = 0; i < n_samples; ++i){
-            double s = arc.L / n_samples * i;
-            p = circline(arc.x0, arc.y0, arc.th0, s, arc.k);
-        }
+    // &p - &v[0] is a nice hack to get the element idx without race conditions
+    std::for_each(std::execution::par_unseq, v.begin(), v.end(), [&](auto& p){
+        double s = arc.L / n_samples * (&p - &v[0]);
+        p = circline(arc.x0, arc.y0, arc.th0, s, arc.k);
     });
 
     return v;
@@ -140,7 +175,7 @@ Planner::Planner() : Node("planner_node"){
 }
 
 /**
- * @brief callbacks to gather the necessary data 
+ * @brief callbacks to gather the necessary data, a latch is used to sync with the planning phase
  */
 ///@{
 void Planner::obstacles_callback(obstacles_msgs::msg::ObstacleArrayMsg msg){
@@ -185,7 +220,7 @@ void Planner::sub2_callback(geometry_msgs::msg::PoseWithCovarianceStamped msg){
  * could potentially work with any type of trajectory. The idea is to approximate curves using line segments 
  * and the do clipping using the enviroment as a clip and the trajectory as an open subject
  * 
- * @todo test
+ * @todo test and, if we find a good sampling heuristic, try to clip multiple curves at once for optimization
  */
 bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env){
     static constexpr double e = 1e-6;
@@ -197,7 +232,7 @@ bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env)
     );
 
     Clipper2Lib::ClipperD cd;
-    cd.AddClip({ env.begin() + 1, env.end() });
+    cd.AddClip(Clipper2Lib::PathsD{ env.begin() + 1, env.end() });
     cd.AddOpenSubject(polylines);
     cd.Execute(Clipper2Lib::ClipType::Intersection, Clipper2Lib::FillRule::NonZero, garbage, intersections);
     if (intersections.size())
@@ -210,7 +245,8 @@ bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env)
 }
 
 /**
- * @brief get a safe (collision free) dubins curve to go from a to b using clipper2
+ * @brief get a safe (collision free) dubins curve to go from a to b using clipper2, if not found
+ * just assert 0, error handling is pretty useless at this point (there's no path anyway)
  * 
  * @param a starting point
  * @param th0 starting angle
@@ -225,13 +261,14 @@ bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env)
  */
 dubins::d_curve Planner::sample_curve(VisiLibity::Point a, double th0, VisiLibity::Point b, double thf, double Kmax){
     auto paths = dubins::d_paths(a.x(), a.y(), th0, b.x(), b.y(), thf, Kmax);
-    std::cerr << paths.size() << '\n';
 
     for (const auto& c : paths)
-        if (is_collision_free(c, min_env)) return c;
+        if (is_collision_free(c, min_env_)) return c;
 
     // TODO: sample a good point to try and find a new feasible path
-    assert(0 && "No feasible path found!");
+    RCLCPP_ERROR("Could not find a feasible path using dubins curves to go from (%lf, %lf) to (%lf, %lf)!\n",
+        a.x(), a.y(). b.x(), b.y());
+    rclcpp::shutdown();
 }
 
 /**
@@ -240,6 +277,7 @@ dubins::d_curve Planner::sample_curve(VisiLibity::Point a, double th0, VisiLibit
  * @param a starting point
  * @param b intersection point of the two edges
  * @param c ending point of the third edge
+ * @param [out] new_a ending point of dubins curve
  * @param r minmum curvature radius
  * @return the collision safe dubins curve
  */
@@ -254,9 +292,6 @@ dubins::d_curve Planner::get_safe_curve(VisiLibity::Point a, VisiLibity::Point b
     double vyf = c.y() - b.y();
     double thf = atan2(vyf, vxf); // * sgn(vyf);
 
-    /*
-    norm0...
-     */
     double normf = sqrt(vxf * vxf + vyf * vyf);
     double unitxf = vxf / normf;
     double unityf = vyf / normf;
@@ -266,6 +301,7 @@ dubins::d_curve Planner::get_safe_curve(VisiLibity::Point a, VisiLibity::Point b
      * |A×B| = |A| |B| sin(θ)
      * with this we can easily get the angle between the two vectors
      * we add fabs to normalize in [0, pi)
+     * M_PI - angle cause _/ -> /_ 
      */
     double alpha = M_PI - atan2(fabs(vx0 * vyf - vy0 * vxf), vx0 * vxf + vy0 * vyf);
     double sina, cosa;
@@ -280,7 +316,7 @@ dubins::d_curve Planner::get_safe_curve(VisiLibity::Point a, VisiLibity::Point b
     [[maybe_unused]] auto ok = dubins::d_shortest(a.x(), a.y(), th0, xf, yf, thf, 1. / r, curve);
 #ifdef __DEBUG
     assert(ok != -1); // should be fine (by construction)
-    assert(curve.a1.x0 - curve.a2.x0 < 1e-16 && curve.a1.y0 - curve.a2.y0 < 1e-16); // the epsilon is actually needed
+    assert(curve.a1.x0 - curve.a2.x0 < 1e-12 && curve.a1.y0 - curve.a2.y0 < 1e-12); // the epsilon is actually needed
 #endif
     return curve;
 }
@@ -291,30 +327,39 @@ dubins::d_curve Planner::get_safe_curve(VisiLibity::Point a, VisiLibity::Point b
  * @todo angle case 3
  */
 multi_dubins::path_t Planner::dubins_path(const VisiLibity::Polyline& path, double th0, double thf, double r){
-    multi_dubins::path_t sol{ path.size() - 2 };
-
+    double th;
     switch (path.size()){
     case 2:
         return { sample_curve(path[0], th0, path[1], thf, 1. / min_r) };
     case 3:
-        return {};
+        // note th as intermediate angle might not always be the best but it'll do for now
+        th = atan2(path[2].y() - path[1].y(), path[2].x() - path[1].x());
+        return { 
+            sample_curve(path[0], th0, path[1], th, 1. / min_r),
+            sample_curve(path[1], th, path[2], thf, 1. / min_r)
+        };
     case 4:
-        return {};
+        th = atan2(path[2].y() - path[1].y(), path[2].x() - path[1].x());
+        dubins::d_curve safe_curve;
+        dubins::d_shortest(path[1].x(), path[1].y(), th, path[2].x(), path[2].y(), th, 1. / min_r, safe_curve);
+        return {
+            sample_curve(path[0], th0, path[1], th, 1. / min_r),
+            safe_curve, // always a straight line, in line with our intermediate curves strategy
+            sample_curve(path[2], th, path[3], thf, 1. / min_r)
+        };
     // default:
     }
 
     // general case
+    multi_dubins::path_t sol{ path.size() - 1 };
     VisiLibity::Point new_a = path[1];
-    for (uint64_t i = 1; i < path.size() - 2; ++i){
-        std::cout << "(" << new_a.x() << ", " << new_a.y() << "), ";
-        std::cout << "(" << path[i + 1].x() << ", " << path[i + 1].y() << "), ";
-        std::cout << "(" << path[i + 2].x() << ", " << path[i + 2].y() << ")\n";
+    for (uint64_t i = 1; i < path.size() - 2; ++i)
         sol[i] = get_safe_curve(new_a, path[i + 1], path[i + 2], new_a, r);
-    }
 
     /*
-    // NOTE: only iff we use the alternative method
-    // manually construct the last safe segment (always a straight line)
+    // NOTE: The alternative method
+    // manually construct the last safe segment as a safe line instead that as a line + arc
+    // it's non-trivial to choose which one is best
     const auto& tmp = path[path.size() - 2];
     const double th = sol[sol.size() - 3].a3.thf;
     double last_l = sqrt((new_a.x() - tmp.x()) * (new_a.x() - tmp.x()) + (new_a.y() - tmp.y()) * (new_a.y() - tmp.y()));
@@ -325,8 +370,8 @@ multi_dubins::path_t Planner::dubins_path(const VisiLibity::Polyline& path, doub
         last_l
     };
     */
-    // sol.front() = sample_curve();
-    // sol.end() = sample_curve();
+    sol.front() = sample_curve(path[0], th0, path[1], sol[1].a1.th0, 1. / min_r);
+    sol.back() = sample_curve(new_a, sol[sol.size() - 2].a3.thf, path[path.size() - 1], thf, 1. / min_r);
 
 #ifdef __DEBUG
     std::cout << "------------------------------------------------------------------------------------------\n";
@@ -341,22 +386,6 @@ multi_dubins::path_t Planner::dubins_path(const VisiLibity::Polyline& path, doub
 
     return sol;
 }
-
-/*
-// TODO
-VisiLibity::Polyline my_BAstar(VisiLibity::Environment env, VisiLibity::Visibility_Graph g,
-    VisiLibity::Point start, VisiLibity::Point end, double e){
-    VisiLibity::Polyline short_p;
-
-    // trivial case
-    VisiLibity::Visibility_Polygon start_vp(start, env, e);
-    if (end.in(start_vp, e))
-        return VisiLibity::Polyline({start, end});
-
-    VisiLibity::Visibility_Polygon end_vp(end, env, e);
-    std::vector
-}
-*/
 
 /**
  * @brief function that generates the path planning for the 3 robots using, when possible, parallel execution
@@ -377,11 +406,11 @@ void Planner::plan(){
     VisiLibity::Point robot1{pos1_.position.x, pos1_.position.y};
     VisiLibity::Point robot2{pos2_.position.x, pos2_.position.y};
     VisiLibity::Point gate{gate_msg_.poses[0].position.x, gate_msg_.poses[0].position.y};
-    [[maybe_unused]] double th0 = get_yaw(pos0_.orientation);
-    [[maybe_unused]] double th1 = get_yaw(pos1_.orientation);
-    [[maybe_unused]] double th2 = get_yaw(pos2_.orientation);
-    [[maybe_unused]] double thg = get_yaw(gate_msg_.poses[0].orientation); // ???
-    thg = M_PI / 2.;
+    double th0 = get_yaw(pos0_.orientation);
+    double th1 = get_yaw(pos1_.orientation);
+    double th2 = get_yaw(pos2_.orientation);
+    double thg = get_yaw(gate_msg_.poses[0].orientation); 
+    // thg *= -1; // IMHO it's a bug that sometimes it gives the opposite angle
 
     // generating Clipper data
     // Clipper vector of polygons to offset
@@ -397,22 +426,41 @@ void Planner::plan(){
     // insert (in a parallel way) the obstacles
     std::transform(std::execution::par_unseq, obstacles_msg_.obstacles.begin(), obstacles_msg_.obstacles.end(), 
         clipper_obs.begin(), [](const auto& ob){
+        // Can't wait for c++26 to allow constexpr cmath functions (:
+        constexpr double sec30 = 1.1547005383792515290182975610039149112952035025402537520372046529;
+        constexpr double cos60 = .5;
+        constexpr double sin60 = 0.8660254037844386467637231707529361834714026269051903140279034897;
+
+        // circles are approximated to hexagons
+        if (ob.radius){
+            const double r = ob.radius;
+            const double xc = ob.polygon.points[0].x;
+            const double yc = ob.polygon.points[0].y;
+            // closed solution for the hexagon
+            return Clipper2Lib::PathD({
+                {xc + r * sec30, yc},
+                {xc + r * sec30 * cos60, yc - r * sec30 * sin60},
+                {xc - r * sec30 * cos60, yc - r * sec30 * sin60},
+                {xc - r * sec30, yc},
+                {xc - r * sec30 * cos60, yc + r * sec30 * sin60},
+                {xc + r * sec30 * cos60, yc + r * sec30 * sin60}
+            });
+        }
+
         Clipper2Lib::PathD polygon(ob.polygon.points.size());
         for (auto i = 0UL; i < ob.polygon.points.size(); ++i)
             polygon[i] = Clipper2Lib::PointD(ob.polygon.points[i].x, ob.polygon.points[i].y);
         return polygon;
     });
     
-#ifdef __DEBUG
     desmos_dump(clipper_obs);
-#endif
+
     // get the offsetted enviroment + a minimum offset version of the obstacles used for collision detection when needed
-    min_env = offsetting::offset_minimum(clipper_border, clipper_obs, hrobot_sz);
+    min_env_ = offsetting::offset_minimum(clipper_border, clipper_obs, hrobot_sz);
     auto aux = offsetting::offset_env(clipper_border, clipper_obs, hrobot_sz, min_r);
-#ifdef __DEBUG
-    desmos_dump(min_env);
+
+    desmos_dump(min_env_);
     desmos_dump(aux);
-#endif
 
     // generating VisiLibity enviroment
     std::vector<VisiLibity::Polygon> visilibity_env(aux.size());
@@ -422,28 +470,37 @@ void Planner::plan(){
             ptmp.push_back(VisiLibity::Point(i->x, i->y));
         return ptmp;
     });
-    VisiLibity::Environment env(visilibity_env);
-    assert(env.is_valid(e)); // if this fails it might be needed to reduce e
+    env_(visilibity_env);
+    assert(env.is_valid(e)); // if this fails it might be needed to reduce e (cause 0.001 is fairly big)
 
     // visibility graph
-    VisiLibity::Visibility_Graph g(env, e);
-    auto short_p0 = env.shortest_path(robot0, gate, g, e);
-    auto short_p1 = env.shortest_path(robot1, gate, g, e);
-    auto short_p2 = env.shortest_path(robot2, gate, g, e);
-#ifdef __DEBUG
+    VisiLibity::Visibility_Graph g(env_, e);
+    // NOTE: it is assumed that the center of the robot is at least .5m from the obstacles for this to work properly
+    // this should be a reasonable request as the robot ha a radius of ~.4m (.35 + .05 for safety) 
+    // (it might still work even if this is not satisfied)
+    /*
+    // to check if it's really ok use (the gate should always be fine)
+    robot0.in(env, e);
+    robot1.in(env, e);
+    robot2.in(env, e);
+    */
+    auto short_p0 = env_.shortest_path(robot0, gate, g, e);
+    auto short_p1 = env_.shortest_path(robot1, gate, g, e);
+    auto short_p2 = env_.shortest_path(robot2, gate, g, e);
+
     path_dump(short_p0);
     path_dump(short_p1);
     path_dump(short_p2);
-#endif
 
     // get the path made out of dubin curves
     multi_dubins::path_t p0;
     multi_dubins::path_t p1;
     multi_dubins::path_t p2;
-
     p0 = dubins_path(short_p0, th0, thg, min_r);
-    std::cout << p0[0].a1.x0 << " " << p0[0].a1.y0 << '\n';
-    std::cout << p0[0].a2.x0 << " " << p0[0].a2.y0 << '\n';
-    std::cout << p0[0].a3.x0 << " " << p0[0].a3.y0 << '\n';
-    std::cout << p0[0].a3.xf << " " << p0[0].a3.yf << '\n';
+    p1 = dubins_path(short_p1, th1, thg, min_r);
+    p2 = dubins_path(short_p2, th2, thg, min_r);
+    
+    dubins_dump(p0);
+    dubins_dump(p1);
+    dubins_dump(p2);
 }

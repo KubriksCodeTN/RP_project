@@ -9,6 +9,8 @@
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
+#include <nav2_msgs/action/follow_path.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
 #include <latch>
 #include <vector>
 #include <execution>
@@ -27,7 +29,9 @@
 class Planner : public rclcpp::Node{
     private:
         // enviroment for collision checks
-        Clipper2Lib::PathsD min_env;
+        Clipper2Lib::PathsD min_env_;
+        // Visilibity enviroment
+        VisiLibity::Environment env_;
 
         // this can be modular but for now there are 3 robots
         rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub0_;
@@ -53,6 +57,10 @@ class Planner : public rclcpp::Node{
         obstacles_msgs::msg::ObstacleArrayMsg obstacles_msg_;
         geometry_msgs::msg::Polygon borders_msg_;
         geometry_msgs::msg::PoseArray gate_msg_;
+
+        rclcpp_action::Client<nav2_msgs::action::FollowPath>::SharedPtr client1_;
+        rclcpp_action::Client<nav2_msgs::action::FollowPath>::SharedPtr client2_;
+        rclcpp_action::Client<nav2_msgs::action::FollowPath>::SharedPtr client3_;
         
         // callbacks
         void obstacles_callback(obstacles_msgs::msg::ObstacleArrayMsg);
@@ -76,6 +84,4 @@ class Planner : public rclcpp::Node{
         Planner();
         void plan();
         multi_dubins::path_t dubins_path(const VisiLibity::Polyline&, double, double, double);
-        // my_BAstar
-        // bool sample_curve();
 };
