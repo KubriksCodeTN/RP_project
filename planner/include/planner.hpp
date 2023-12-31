@@ -14,6 +14,7 @@
 #include <latch>
 #include <vector>
 #include <execution>
+#include <ranges>
 #include "offsetting.hpp"
 #include "clipper.h"
 #include "multi_dubins.hpp"
@@ -73,6 +74,7 @@ class Planner : public rclcpp::Node{
     protected:
         dubins::d_curve get_safe_curve(VisiLibity::Point, VisiLibity::Point, VisiLibity::Point, VisiLibity::Point&, double);
         dubins::d_curve sample_curve(VisiLibity::Point, double, VisiLibity::Point, double, double);
+        nav_msgs::msg::Path getPathMsg(const Clipper2Lib::PathsD&);
         
     public:
         // robot constraints
@@ -80,6 +82,8 @@ class Planner : public rclcpp::Node{
         static inline constexpr double min_r = .5;
         // by assuming the diameter of the circle is 0.8 (instead of 0.5 * sqrt(2)) we are already adding some safety to our paths
         static inline constexpr double hrobot_sz = .4;
+        // 
+        // static inline constexpr double velocity = 
 
         Planner();
         void plan();

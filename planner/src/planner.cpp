@@ -5,11 +5,13 @@
 #include <cmath>
 #include <cassert>
 
-#define __DEBUG
-
 using std::placeholders::_1;
+namespace srv = std::ranges::views;
+using sampling_t = std::tuple<Clipper2Lib::PathsD, std::vector<double>>;
 
+#define __DEBUG
 #ifdef __DEBUG
+
 Clipper2Lib::PathD sample_arc(dubins::d_arc, uint_fast32_t);
 
 /**
@@ -53,12 +55,13 @@ void arc_dump(auto path){
  */
 void dubins_dump(const auto& dpath){
     for (const auto& c : dpath){
-        arc_dump(sample_arc(c.a1));
-        arc_dump(sample_arc(c.a2));
-        arc_dump(sample_arc(c.a3));
+        arc_dump(sample_arc(c.a1, 4));
+        arc_dump(sample_arc(c.a2, 4));
+        arc_dump(sample_arc(c.a3, 4));
     }
     std::cout << "---------------------------------------------\n";
 }
+
 #else
 
 #define desmos_dump(x)
@@ -80,6 +83,8 @@ inline constexpr T sgn(T x){
 
 /**
  * @brief numerically stable implementation of the sinc function
+ * 
+ * @note yes, this is duplicated code
  */
 inline constexpr double sinc(double x){
     if (fabs(x) > 0.002)
@@ -100,27 +105,17 @@ inline Clipper2Lib::PointD circline(double x, double y, double th, double s, dou
 }
 
 /**
- * @brief sample a dubins arc
- * 
- * @param arc the dubins arc to sample
- * @param n_samples number of samples needed. 
- *      "How can it be this fast!?" 
- *      "It just is."
+ * @brief sample a point from a line (segment)
  */
-Clipper2Lib::PathD sample_arc(dubins::d_arc arc, uint_fast32_t n_samples = 4){
-    Clipper2Lib::PathD v{ n_samples + 1 };
-
-    // &p - &v[0] is a nice hack to get the element idx without race conditions
-    std::for_each(std::execution::par_unseq, v.begin(), v.end(), [&](auto& p){
-        double s = arc.L / n_samples * (&p - &v[0]);
-        p = circline(arc.x0, arc.y0, arc.th0, s, arc.k);
-    });
-
-    return v;
+inline Clipper2Lib::PointD lineline(double x0, double y0, double xf, double yf, double s){
+    return { 
+        x0 + s * (xf - x0), 
+        y0 + s * (yf - y0),
+    };
 }
 
 /**
- * @brief get w angle from a quaternion msg
+ * @brief get yaw angle from a quaternion msg
  */
 inline double get_yaw(const auto& orientation){
     tf2::Quaternion q;
@@ -134,6 +129,64 @@ inline double get_yaw(const auto& orientation){
     // q.normalize(); // should already be normalized
     tf2::Matrix3x3(q).getRPY(garbage_r, garbage_p, th);
     return th;
+}
+
+/**
+ * @brief creates msg to send on topic /shelfino#/plan
+ * 
+ * @param fpath the path to send on the topic
+ * @return the created msg
+ * 
+ * @todo debug
+ */
+nav_msgs::msg::Path Planner::getPathMsg(const Clipper2Lib::PathsD& fpath){
+
+    nav_msgs::msg::Path path;
+    path.header.stamp = this->get_clock()->now();
+    path.header.frame_id = "map";
+    std::vector<geometry_msgs::msg::PoseStamped> posesTemp{ fpath[0].size() + fpath[1].size() + fpath[2].size() };
+
+    assert(0 && "TODO");
+
+    return path;
+}
+
+/**
+ * @brief sample a dubins arc
+ * 
+ * @param arc the dubins arc to sample
+ * @param n_samples fast number of samples needed. 
+ *      "How can it be this fast!?" 
+ *      "It just is."
+ */
+Clipper2Lib::PathD sample_arc(dubins::d_arc arc, uint_fast32_t n_samples = 30){
+    Clipper2Lib::PathD v{ n_samples + 1 };
+
+    // &p - &v[0] is a nice hack to get the element idx without race conditions
+    std::for_each(std::execution::par_unseq, v.begin(), v.end(), [&](auto& p){
+        double s = arc.L / n_samples * (&p - &v[0]);
+        p = circline(arc.x0, arc.y0, arc.th0, s, arc.k);
+    });
+
+    return v;
+}
+
+/**
+ * @brief sample a line (segment)
+ * 
+ * @param line the line to sample
+ * @param n_samples number of samples needed. 
+ */
+Clipper2Lib::PathD sample_line(dubins::d_arc line, uint32_t n_samples = 30){
+    Clipper2Lib::PathD v{ n_samples + 1 };
+
+    // &p - &v[0] is a nice hack to get the element idx without race conditions
+    std::for_each(std::execution::par_unseq, v.begin(), v.end(), [&](auto& p){
+        double s = 1. / n_samples * (&p - &v[0]);
+        p = lineline(line.x0, line.y0, line.xf, line.yf, s);
+    });
+
+    return v;
 }
 
 /**
@@ -216,10 +269,80 @@ void Planner::sub2_callback(geometry_msgs::msg::PoseWithCovarianceStamped msg){
 ///@}
 
 /**
+ * @brief samples the path in segments that are long l
+ * 
+ * @param p path to sample
+ * @param l length of the segments to sample (except for the last one of each arc due to remainder)
+ * @param s_curves number of starting curves before safe path
+ * @param e_curves number of ending curves after safe path
+ * @return the sampled points, and the length of the path from the start to that point
+ * 
+ * @note s_curves and e_curves are here in case we find a good sampling way for intermediate points
+ * in the first and last trait 
+ * @todo better handling of ls
+ */
+sampling_t sample_path(const multi_dubins::path_t& p, double l, uint64_t s_curves = 1, uint64_t e_curves = 1){
+    Clipper2Lib::PathsD out{ 3 };
+    std::vector<double> ls;
+    double curr_l = 0;
+
+    // lambdas are a nice way to avoid duplicated code
+    auto aux_sample_arc = [&](const auto& arc, size_t sz, int32_t i){
+        for (size_t j = 1; j <= sz; ++j){
+            double s = arc.L / sz * j;
+            out[i].push_back(circline(arc.x0, arc.y0, arc.th0, s, arc.k));
+            ls.push_back(curr_l + l * j);
+        } 
+    };
+
+    auto aux_sample_line = [&](const auto& line, size_t sz, int32_t i){
+        for (size_t j = 1; j <= sz; ++j){
+            double s = 1. / sz * j;
+            out[i].push_back(lineline(line.x0, line.y0, line.xf, line.yf, s));
+            ls.push_back(curr_l + l * j);
+        } 
+    };
+
+    out.back().push_back({ p.front().a1.x0, p.front().a1.y0 });
+    ls.push_back(curr_l);
+
+    for (size_t i = 0; i < s_curves; ++i){
+        aux_sample_arc(p[i].a1, p[i].a1.L / l, 0);
+        curr_l += p[i].a1.L;
+        p[i].a2.th0 == p[i].a2.thf ? aux_sample_line(p[i].a2, p[i].a2.L / l, 0) : aux_sample_arc(p[i].a2, p[i].a2.L / l, 0);
+        curr_l += p[i].a2.L;
+        aux_sample_arc(p[i].a3, p[i].a3.L / l, 0);
+        curr_l += p[i].a3.L;
+    }
+
+    for (size_t i = s_curves; i < p.size() - e_curves; ++i){
+        aux_sample_arc(p[i].a1, p[i].a1.L / l, 1);
+        curr_l += p[i].a1.L;
+        p[i].a2.th0 == p[i].a2.thf ? aux_sample_line(p[i].a2, p[i].a2.L / l, 1) : aux_sample_arc(p[i].a2, p[i].a2.L / l, 1);
+        curr_l += p[i].a2.L;
+        aux_sample_arc(p[i].a3, p[i].a3.L / l, 1);
+        curr_l += p[i].a3.L;
+    }
+
+    
+    for (size_t i = p.size() - e_curves; i < p.size(); ++i){
+        aux_sample_arc(p[i].a1, p[i].a1.L / l, 2);
+        curr_l += p[i].a1.L;
+        p[i].a2.th0 == p[i].a2.thf ? aux_sample_line(p[i].a2, p[i].a2.L / l, 2) : aux_sample_arc(p[i].a2, p[i].a2.L / l, 2);
+        curr_l += p[i].a2.L;
+        aux_sample_arc(p[i].a3, p[i].a3.L / l, 2);
+        curr_l += p[i].a3.L;
+    }
+
+    return { out, ls };
+}
+
+/**
  * @brief check if a given dubins path is collision free using clipper, this method is very general as it
  * could potentially work with any type of trajectory. The idea is to approximate curves using line segments 
  * and the do clipping using the enviroment as a clip and the trajectory as an open subject
  * 
+ * @note under the assumption of rectangles as borders we could use RectClip which is more efficient
  * @todo test and, if we find a good sampling heuristic, try to clip multiple curves at once for optimization
  */
 bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env){
@@ -246,7 +369,7 @@ bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env)
 
 /**
  * @brief get a safe (collision free) dubins curve to go from a to b using clipper2, if not found
- * just assert 0, error handling is pretty useless at this point (there's no path anyway)
+ * just shutdown, error handling is pretty useless at this point (there's no path anyway)
  * 
  * @param a starting point
  * @param th0 starting angle
@@ -266,9 +389,10 @@ dubins::d_curve Planner::sample_curve(VisiLibity::Point a, double th0, VisiLibit
         if (is_collision_free(c, min_env_)) return c;
 
     // TODO: sample a good point to try and find a new feasible path
-    RCLCPP_ERROR("Could not find a feasible path using dubins curves to go from (%lf, %lf) to (%lf, %lf)!\n",
-        a.x(), a.y(). b.x(), b.y());
+    RCLCPP_ERROR(this->get_logger(), "Could not find a feasible path using dubins curves to go from (%lf, %lf) to (%lf, %lf)!\n",
+        a.x(), a.y(), b.x(), b.y());
     rclcpp::shutdown();
+    exit(1);
 }
 
 /**
@@ -332,7 +456,8 @@ multi_dubins::path_t Planner::dubins_path(const VisiLibity::Polyline& path, doub
     case 2:
         return { sample_curve(path[0], th0, path[1], thf, 1. / min_r) };
     case 3:
-        // note th as intermediate angle might not always be the best but it'll do for now
+        // note th as intermediate angle might not always be the best but it looks like 
+        // a decent choice for O(1) time algorithm
         th = atan2(path[2].y() - path[1].y(), path[2].x() - path[1].x());
         return { 
             sample_curve(path[0], th0, path[1], th, 1. / min_r),
@@ -410,7 +535,7 @@ void Planner::plan(){
     double th1 = get_yaw(pos1_.orientation);
     double th2 = get_yaw(pos2_.orientation);
     double thg = get_yaw(gate_msg_.poses[0].orientation); 
-    // thg *= -1; // IMHO it's a bug that sometimes it gives the opposite angle
+    // thg *= -1; // IMHO it's a bug that sometimes it gives the opposite angle (opposite to the wall)
 
     // generating Clipper data
     // Clipper vector of polygons to offset
@@ -470,8 +595,8 @@ void Planner::plan(){
             ptmp.push_back(VisiLibity::Point(i->x, i->y));
         return ptmp;
     });
-    env_(visilibity_env);
-    assert(env.is_valid(e)); // if this fails it might be needed to reduce e (cause 0.001 is fairly big)
+    env_ = VisiLibity::Environment(visilibity_env);
+    assert(env_.is_valid(e)); // if this fails it might be needed to reduce e (cause 0.001 is fairly big)
 
     // visibility graph
     VisiLibity::Visibility_Graph g(env_, e);
@@ -496,6 +621,9 @@ void Planner::plan(){
     multi_dubins::path_t p0;
     multi_dubins::path_t p1;
     multi_dubins::path_t p2;
+    /*
+     * NOTE: this could easily be done by three separated threads but idk if the libraries are thread safe
+     */
     p0 = dubins_path(short_p0, th0, thg, min_r);
     p1 = dubins_path(short_p1, th1, thg, min_r);
     p2 = dubins_path(short_p2, th2, thg, min_r);
@@ -503,4 +631,37 @@ void Planner::plan(){
     dubins_dump(p0);
     dubins_dump(p1);
     dubins_dump(p2);
+
+    double l = .15; // good enough?
+    // int32_t s0, e0, s1, e1, s2, e2;
+    auto s_plus_l0 = sample_path(p0, l, 1, 1);
+    auto s_plus_l1 = sample_path(p1, l, 1, 1);
+    auto s_plus_l2 = sample_path(p2, l, 1, 1);
+    // handy tuple unpack feature from c++17
+    const auto& [samples0, ls0] = s_plus_l0;
+    const auto& [samples1, ls1] = s_plus_l1;
+    const auto& [samples2, ls2] = s_plus_l2;
+
+#ifdef __DEBUG
+    for (const auto& v : samples0)
+        for (const auto& p : v)
+            std::cout << "(" << p.x << ", " << p.y << ")\n";
+    
+    for (const auto l : ls0)
+        std::cout << l << '\n';
+
+    for (const auto& v : samples1)
+        for (const auto& p : v)
+            std::cout << "(" << p.x << ", " << p.y << ")\n";
+
+    for (const auto l : ls1)
+        std::cout << l << '\n';
+
+    for (const auto& v : samples2)
+        for (const auto& p : v)
+            std::cout << "(" << p.x << ", " << p.y << ")\n";
+    
+    for (const auto l : ls2)
+        std::cout << l << '\n';
+#endif
 }
