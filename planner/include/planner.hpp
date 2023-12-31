@@ -59,9 +59,9 @@ class Planner : public rclcpp::Node{
         geometry_msgs::msg::Polygon borders_msg_;
         geometry_msgs::msg::PoseArray gate_msg_;
 
+        rclcpp_action::Client<nav2_msgs::action::FollowPath>::SharedPtr client0_;
         rclcpp_action::Client<nav2_msgs::action::FollowPath>::SharedPtr client1_;
         rclcpp_action::Client<nav2_msgs::action::FollowPath>::SharedPtr client2_;
-        rclcpp_action::Client<nav2_msgs::action::FollowPath>::SharedPtr client3_;
         
         // callbacks
         void obstacles_callback(obstacles_msgs::msg::ObstacleArrayMsg);
@@ -74,7 +74,7 @@ class Planner : public rclcpp::Node{
     protected:
         dubins::d_curve get_safe_curve(VisiLibity::Point, VisiLibity::Point, VisiLibity::Point, VisiLibity::Point&, double);
         dubins::d_curve sample_curve(VisiLibity::Point, double, VisiLibity::Point, double, double);
-        nav_msgs::msg::Path getPathMsg(const Clipper2Lib::PathsD&);
+        nav_msgs::msg::Path get_path_msg(const Clipper2Lib::PathsD&);
         
     public:
         // robot constraints
