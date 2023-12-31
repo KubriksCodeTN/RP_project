@@ -139,15 +139,40 @@ inline double get_yaw(const auto& orientation){
  * 
  * @todo debug
  */
-nav_msgs::msg::Path Planner::getPathMsg(const Clipper2Lib::PathsD& fpath){
+nav_msgs::msg::Path Planner::get_path_msg(const Clipper2Lib::PathsD& fpath){
 
     nav_msgs::msg::Path path;
     path.header.stamp = this->get_clock()->now();
     path.header.frame_id = "map";
-    std::vector<geometry_msgs::msg::PoseStamped> posesTemp{ fpath[0].size() + fpath[1].size() + fpath[2].size() };
 
-    assert(0 && "TODO");
+    std::vector<geometry_msgs::msg::PoseStamped> poses_tmp{ fpath[0].size() + fpath[1].size() + fpath[2].size() };
 
+    const uint32_t a = fpath[0].size();
+    const uint32_t b = fpath[0].size() + fpath[1].size();
+    const uint32_t c = fpath[0].size() + fpath[1].size() + fpath[2].size();
+
+    auto fill_pose = [this, &fpath](geometry_msgs::msg::PoseStamped& pose_stamp, int32_t pidx, int32_t idx){
+        pose_stamp.pose.position.x = fpath[pidx][idx].x;
+        pose_stamp.pose.position.y = fpath[pidx][idx].y;
+        pose_stamp.pose.position.z = 0;
+
+        pose_stamp.pose.orientation.x = 0;
+        pose_stamp.pose.orientation.y = 0;
+        pose_stamp.pose.orientation.z = 0;
+        pose_stamp.pose.orientation.w = 0;
+
+        pose_stamp.header.stamp = this->get_clock()->now();
+        pose_stamp.header.frame_id = "base_link";
+    };
+
+    for (size_t i = 0; i < a; ++i)
+        fill_pose(poses_tmp[i], 0, i);
+    for (size_t i = a; i < b; ++i)
+        fill_pose(poses_tmp[i], 1, i);
+    for (size_t i = b; i < c; ++i)
+        fill_pose(poses_tmp[i], 2, i);
+
+    path.poses = std::move(poses_tmp);
     return path;
 }
 
@@ -175,7 +200,7 @@ Clipper2Lib::PathD sample_arc(dubins::d_arc arc, uint_fast32_t n_samples = 30){
  * @brief sample a line (segment)
  * 
  * @param line the line to sample
- * @param n_samples number of samples needed. 
+ * @param n_samples not so fast number of samples needed. 
  */
 Clipper2Lib::PathD sample_line(dubins::d_arc line, uint32_t n_samples = 30){
     Clipper2Lib::PathD v{ n_samples + 1 };
@@ -193,9 +218,12 @@ Clipper2Lib::PathD sample_line(dubins::d_arc line, uint32_t n_samples = 30){
  * @brief constructor of the Planner class
  */
 Planner::Planner() : Node("planner_node"){
-    pub0_ = this->create_publisher<nav_msgs::msg::Path>("shelfino0/plan", 10);
-    pub1_ = this->create_publisher<nav_msgs::msg::Path>("shelfino1/plan", 10);
-    pub2_ = this->create_publisher<nav_msgs::msg::Path>("shelfino2/plan", 10);
+    pub0_ = this->create_publisher<nav_msgs::msg::Path>("shelfino0/plan1", 10);
+    pub1_ = this->create_publisher<nav_msgs::msg::Path>("shelfino1/plan1", 10);
+    pub2_ = this->create_publisher<nav_msgs::msg::Path>("shelfino2/plan1", 10);
+    client0_ = rclcpp_action::create_client<nav2_msgs::action::FollowPath>(this,"shelfino0/follow_path");
+    client1_ = rclcpp_action::create_client<nav2_msgs::action::FollowPath>(this,"shelfino1/follow_path");
+    client2_ = rclcpp_action::create_client<nav2_msgs::action::FollowPath>(this,"shelfino2/follow_path");
 
     static constexpr rmw_qos_profile_t rmw_qos_profile_custom = {
         RMW_QOS_POLICY_HISTORY_KEEP_LAST,
@@ -535,7 +563,6 @@ void Planner::plan(){
     double th1 = get_yaw(pos1_.orientation);
     double th2 = get_yaw(pos2_.orientation);
     double thg = get_yaw(gate_msg_.poses[0].orientation); 
-    // thg *= -1; // IMHO it's a bug that sometimes it gives the opposite angle (opposite to the wall)
 
     // generating Clipper data
     // Clipper vector of polygons to offset
@@ -632,7 +659,7 @@ void Planner::plan(){
     dubins_dump(p1);
     dubins_dump(p2);
 
-    double l = .15; // good enough?
+    const double l = .15; // good enough?
     // int32_t s0, e0, s1, e1, s2, e2;
     auto s_plus_l0 = sample_path(p0, l, 1, 1);
     auto s_plus_l1 = sample_path(p1, l, 1, 1);
@@ -642,6 +669,23 @@ void Planner::plan(){
     const auto& [samples1, ls1] = s_plus_l1;
     const auto& [samples2, ls2] = s_plus_l2;
 
+    auto path_msg0 = get_path_msg(samples0);
+    pub0_->publish(path_msg0);
+    
+    if (!client0_->wait_for_action_server()){
+        RCLCPP_ERROR(this->get_logger(), "Failed to wait for nav2 server!\n");
+        rclcpp::shutdown();
+        exit(1);
+    }
+
+    // TODO better future handling using callbacks (the node should be spinning in the executor)
+    auto follow_msg0 = nav2_msgs::action::FollowPath::Goal();
+    follow_msg0.path = path_msg0;
+    follow_msg0.controller_id = "FollowPath";
+    client0_->async_send_goal(follow_msg0);
+
+
+/*
 #ifdef __DEBUG
     for (const auto& v : samples0)
         for (const auto& p : v)
@@ -664,4 +708,5 @@ void Planner::plan(){
     for (const auto l : ls2)
         std::cout << l << '\n';
 #endif
+*/
 }
