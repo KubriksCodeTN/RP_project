@@ -7,7 +7,7 @@
 
 using std::placeholders::_1;
 namespace srv = std::ranges::views;
-using sampling_t = std::tuple<Clipper2Lib::PathsD, std::vector<double>>;
+using sampling_t = std::tuple<Clipper2Lib::PathD, std::vector<double>>;
 
 #define __DEBUG
 #ifdef __DEBUG
@@ -139,38 +139,27 @@ inline double get_yaw(const auto& orientation){
  * 
  * @todo debug
  */
-nav_msgs::msg::Path Planner::get_path_msg(const Clipper2Lib::PathsD& fpath){
-
+nav_msgs::msg::Path Planner::get_path_msg(const Clipper2Lib::PathD& fpath){
     nav_msgs::msg::Path path;
     path.header.stamp = this->get_clock()->now();
     path.header.frame_id = "map";
 
-    std::vector<geometry_msgs::msg::PoseStamped> poses_tmp{ fpath[0].size() + fpath[1].size() + fpath[2].size() };
+    std::vector<geometry_msgs::msg::PoseStamped> poses_tmp{ fpath.size() };
 
-    const uint32_t a = fpath[0].size();
-    const uint32_t b = fpath[0].size() + fpath[1].size();
-    const uint32_t c = fpath[0].size() + fpath[1].size() + fpath[2].size();
+    for (size_t i = 0; i < fpath.size(); ++i){
+        poses_tmp[i].pose.position.x = fpath[i].x;
+        poses_tmp[i].pose.position.y = fpath[i].y;
+        poses_tmp[i].pose.position.z = 0;
 
-    auto fill_pose = [this, &fpath](geometry_msgs::msg::PoseStamped& pose_stamp, int32_t pidx, int32_t idx){
-        pose_stamp.pose.position.x = fpath[pidx][idx].x;
-        pose_stamp.pose.position.y = fpath[pidx][idx].y;
-        pose_stamp.pose.position.z = 0;
+        poses_tmp[i].pose.orientation.x = 0;
+        poses_tmp[i].pose.orientation.y = 0;
+        poses_tmp[i].pose.orientation.z = 0;
+        poses_tmp[i].pose.orientation.w = 0;
 
-        pose_stamp.pose.orientation.x = 0;
-        pose_stamp.pose.orientation.y = 0;
-        pose_stamp.pose.orientation.z = 0;
-        pose_stamp.pose.orientation.w = 0;
-
-        pose_stamp.header.stamp = this->get_clock()->now();
-        pose_stamp.header.frame_id = "base_link";
+        poses_tmp[i].header.stamp = this->get_clock()->now();
+        poses_tmp[i].header.frame_id = "base_link";
     };
 
-    for (size_t i = 0; i < a; ++i)
-        fill_pose(poses_tmp[i], 0, i);
-    for (size_t i = a; i < b; ++i)
-        fill_pose(poses_tmp[i], 1, i);
-    for (size_t i = b; i < c; ++i)
-        fill_pose(poses_tmp[i], 2, i);
 
     path.poses = std::move(poses_tmp);
     return path;
@@ -301,67 +290,55 @@ void Planner::sub2_callback(geometry_msgs::msg::PoseWithCovarianceStamped msg){
  * 
  * @param p path to sample
  * @param l length of the segments to sample (except for the last one of each arc due to remainder)
- * @param s_curves number of starting curves before safe path
- * @param e_curves number of ending curves after safe path
  * @return the sampled points, and the length of the path from the start to that point
  * 
  * @note s_curves and e_curves are here in case we find a good sampling way for intermediate points
  * in the first and last trait 
- * @todo better handling of ls
  */
-sampling_t sample_path(const multi_dubins::path_t& p, double l, uint64_t s_curves = 1, uint64_t e_curves = 1){
-    Clipper2Lib::PathsD out{ 3 };
+sampling_t sample_path(const multi_dubins::path_t& p, double l){
+    Clipper2Lib::PathD out;
     std::vector<double> ls;
-    double curr_l = 0;
+    double curr_l = 0; 
 
-    // lambdas are a nice way to avoid duplicated code
-    auto aux_sample_arc = [&](const auto& arc, size_t sz, int32_t i){
-        for (size_t j = 1; j <= sz; ++j){
-            double s = arc.L / sz * j;
-            out[i].push_back(circline(arc.x0, arc.y0, arc.th0, s, arc.k));
-            ls.push_back(curr_l + l * j);
-        } 
+    auto aux_arc = [&](const auto& arc, uint32_t n){
+        if (!n){
+            out.emplace_back(arc.x0, arc.y0);
+            ls.push_back(curr_l);
+            return;
+        }
+        for (uint32_t i = 0; i <= n; ++i){
+            double s = arc.L / n * i;
+            out.push_back(circline(arc.x0, arc.y0, arc.th0, s, arc.k));
+            ls.push_back(curr_l + s);
+        }
     };
 
-    auto aux_sample_line = [&](const auto& line, size_t sz, int32_t i){
-        for (size_t j = 1; j <= sz; ++j){
-            double s = 1. / sz * j;
-            out[i].push_back(lineline(line.x0, line.y0, line.xf, line.yf, s));
-            ls.push_back(curr_l + l * j);
-        } 
+    auto aux_line = [&](const auto& arc, uint32_t n){
+        if (!n){
+            out.emplace_back(arc.x0, arc.y0);
+            ls.push_back(curr_l);
+            return;
+        }
+        for (uint32_t i = 0; i <= n; ++i){
+            double s = 1. / n * i;
+            out.push_back(lineline(arc.x0, arc.y0, arc.xf, arc.yf, s));
+            ls.push_back(curr_l + s);
+        }
     };
 
-    out.back().push_back({ p.front().a1.x0, p.front().a1.y0 });
-    ls.push_back(curr_l);
-
-    for (size_t i = 0; i < s_curves; ++i){
-        aux_sample_arc(p[i].a1, p[i].a1.L / l, 0);
+    for (size_t i = 0; i < p.size(); ++i){
+        aux_arc(p[i].a1, p[i].a1.L / l);
         curr_l += p[i].a1.L;
-        p[i].a2.th0 == p[i].a2.thf ? aux_sample_line(p[i].a2, p[i].a2.L / l, 0) : aux_sample_arc(p[i].a2, p[i].a2.L / l, 0);
+
+        p[i].a2.th0 == p[i].a2.thf ? aux_line(p[i].a2, p[i].a2.L / l) : aux_arc(p[i].a2, p[i].a2.L / l);
         curr_l += p[i].a2.L;
-        aux_sample_arc(p[i].a3, p[i].a3.L / l, 0);
+
+        aux_arc(p[i].a3, p[i].a3.L / l);
         curr_l += p[i].a3.L;
     }
 
-    for (size_t i = s_curves; i < p.size() - e_curves; ++i){
-        aux_sample_arc(p[i].a1, p[i].a1.L / l, 1);
-        curr_l += p[i].a1.L;
-        p[i].a2.th0 == p[i].a2.thf ? aux_sample_line(p[i].a2, p[i].a2.L / l, 1) : aux_sample_arc(p[i].a2, p[i].a2.L / l, 1);
-        curr_l += p[i].a2.L;
-        aux_sample_arc(p[i].a3, p[i].a3.L / l, 1);
-        curr_l += p[i].a3.L;
-    }
-
-    
-    for (size_t i = p.size() - e_curves; i < p.size(); ++i){
-        aux_sample_arc(p[i].a1, p[i].a1.L / l, 2);
-        curr_l += p[i].a1.L;
-        p[i].a2.th0 == p[i].a2.thf ? aux_sample_line(p[i].a2, p[i].a2.L / l, 2) : aux_sample_arc(p[i].a2, p[i].a2.L / l, 2);
-        curr_l += p[i].a2.L;
-        aux_sample_arc(p[i].a3, p[i].a3.L / l, 2);
-        curr_l += p[i].a3.L;
-    }
-
+    if (out.back() != Clipper2Lib::PointD(p.back().a3.xf, p.back().a3.yf))
+        out.emplace_back(p.back().a3.xf, p.back().a3.yf);
     return { out, ls };
 }
 
@@ -370,7 +347,8 @@ sampling_t sample_path(const multi_dubins::path_t& p, double l, uint64_t s_curve
  * could potentially work with any type of trajectory. The idea is to approximate curves using line segments 
  * and the do clipping using the enviroment as a clip and the trajectory as an open subject
  * 
- * @note under the assumption of rectangles as borders we could use RectClip which is more efficient
+ * @note under the assumption of rectangles as borders we could use RectClip which is more efficient 
+ * but sadly this is not the case
  * @todo test and, if we find a good sampling heuristic, try to clip multiple curves at once for optimization
  */
 bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env){
@@ -407,7 +385,7 @@ bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env)
  * @return the safe dubins curve
  * 
  * @note to do this we check for collision every possible dubins path from a to b
- * @todo sample a new point using a decent euristic to find a good path like 
+ * @todo sample a new point using a decent euristic to find a feasible path like 
  * a -> intermediate_point -> b
  */
 dubins::d_curve Planner::sample_curve(VisiLibity::Point a, double th0, VisiLibity::Point b, double thf, double Kmax){
@@ -474,7 +452,7 @@ dubins::d_curve Planner::get_safe_curve(VisiLibity::Point a, VisiLibity::Point b
 }
 
 /**
- * @brief create the dubins_path following the proposed strategies 
+ * @brief create the dubins path following the proposed strategies 
  * 
  * @todo angle case 3
  */
@@ -549,7 +527,7 @@ multi_dubins::path_t Planner::dubins_path(const VisiLibity::Polyline& path, doub
  */
 void Planner::plan(){
     // chosen epsilon for enviroment check
-    static constexpr double e = 0.001;
+    static constexpr double e = 1e-6;
     // wait for the needed data
     data_.wait();
 
@@ -563,6 +541,7 @@ void Planner::plan(){
     double th1 = get_yaw(pos1_.orientation);
     double th2 = get_yaw(pos2_.orientation);
     double thg = get_yaw(gate_msg_.poses[0].orientation); 
+    // thg *= -1; // sometimes the gate faces in the opposite direction of the wall and it's impossible to find a path!
 
     // generating Clipper data
     // Clipper vector of polygons to offset
@@ -631,7 +610,7 @@ void Planner::plan(){
     // this should be a reasonable request as the robot ha a radius of ~.4m (.35 + .05 for safety) 
     // (it might still work even if this is not satisfied)
     /*
-    // to check if it's really ok use (the gate should always be fine)
+    // to check if it's really ok use this: (the gate should always be fine)
     robot0.in(env, e);
     robot1.in(env, e);
     robot2.in(env, e);
@@ -659,11 +638,11 @@ void Planner::plan(){
     dubins_dump(p1);
     dubins_dump(p2);
 
-    const double l = .15; // good enough?
+    const double l = .1; // good enough?
     // int32_t s0, e0, s1, e1, s2, e2;
-    auto s_plus_l0 = sample_path(p0, l, 1, 1);
-    auto s_plus_l1 = sample_path(p1, l, 1, 1);
-    auto s_plus_l2 = sample_path(p2, l, 1, 1);
+    auto s_plus_l0 = sample_path(p0, l);
+    auto s_plus_l1 = sample_path(p1, l);
+    auto s_plus_l2 = sample_path(p2, l);
     // handy tuple unpack feature from c++17
     const auto& [samples0, ls0] = s_plus_l0;
     const auto& [samples1, ls1] = s_plus_l1;
@@ -684,16 +663,18 @@ void Planner::plan(){
     follow_msg0.controller_id = "FollowPath";
     client0_->async_send_goal(follow_msg0);
 
-
-/*
 #ifdef __DEBUG
-    for (const auto& v : samples0)
-        for (const auto& p : v)
-            std::cout << "(" << p.x << ", " << p.y << ")\n";
-    
-    for (const auto l : ls0)
-        std::cout << l << '\n';
+    std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : samples0)
+        std::cout << "(" << p.x << ", " << p.y << ")\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << path_msg0.poses.size() << '\n';
+    std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : path_msg0.poses)
+        std::cout << "(" << p.pose.position.x << ", " << p.pose.position.y << ")\n";
 
+    std::cout << "-----------------------------------------------------\n";
+/*
     for (const auto& v : samples1)
         for (const auto& p : v)
             std::cout << "(" << p.x << ", " << p.y << ")\n";
@@ -707,6 +688,6 @@ void Planner::plan(){
     
     for (const auto l : ls2)
         std::cout << l << '\n';
-#endif
 */
+#endif
 }
