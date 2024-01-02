@@ -60,6 +60,16 @@ target_include_directories(offsetting PUBLIC
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
 )
 
+add_library(coordinating src/coordinating.cpp)
+target_link_libraries(coordinating clipper2)
+target_compile_features(coordinating PUBLIC c_std_99 cxx_std_20)
+target_include_directories(coordinating PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/CPP/Clipper2Lib/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/VisiLibity1/src>
+  $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
+)
+
 add_library(planner_node src/planner.cpp)
 ament_target_dependencies(planner_node rclcpp nav_msgs nav2_msgs tf2 rclcpp_action 
   std_srvs rclcpp_components obstacles_msgs geometry_msgs)
@@ -73,7 +83,7 @@ target_include_directories(planner_node PUBLIC
 )
 
 add_executable(planner src/main.cpp)
-target_link_libraries(planner planner_node tbb visilibity1 multi_dubins offsetting)
+target_link_libraries(planner planner_node tbb visilibity1 multi_dubins offsetting coordinating)
 target_compile_features(planner PUBLIC c_std_99 cxx_std_20)  
 target_include_directories(planner PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
