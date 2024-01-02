@@ -16,6 +16,7 @@
 #include <execution>
 #include <ranges>
 #include "offsetting.hpp"
+#include "coordinating.hpp"
 #include "clipper.h"
 #include "multi_dubins.hpp"
 
@@ -87,4 +88,5 @@ class Planner : public rclcpp::Node{
         Planner();
         void plan();
         multi_dubins::path_t dubins_path(const VisiLibity::Polyline&, double, double, double);
+        // void test();
 };

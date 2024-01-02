@@ -74,7 +74,7 @@ constexpr std_vals to_std(double x0, double y0, double th0, double xf,
     double dx = xf - x0;
     double dy = yf - y0;
     double phi = atan2(dy, dx);
-    double tmp = sqrt(dx * dx + dy * dy) / 2;
+    double tmp = sqrt(dx * dx + dy * dy) / 2.;
     // ret.lambda = sqrt(dx * dx + dy * dy) / 2;
     // ret.th0 = mod2pi(th0 - phi);
     // ret.thf = mod2pi(thf - phi);
@@ -95,9 +95,9 @@ bool LSL(double th0, double thf, double Kmax, ls& aux){
     if (tmp2 < 0)
         return false;
 
-    double invK = 1 / Kmax;
+    double invK = 1. / Kmax;
     double C = cos(thf) - cos(th0);
-    double S = 2 * Kmax + sin(th0) - sin(thf);
+    double S = 2. * Kmax + sin(th0) - sin(thf);
     double tmp1 = atan2(C, S);
     aux.s1 = invK * mod2pi(tmp1 - th0);
     aux.s2 = invK * sqrt(tmp2);
@@ -111,7 +111,7 @@ bool RSR(double th0, double thf, double Kmax, ls& aux){
     if (tmp2 < 0)
         return false;
 
-    double invK = 1 / Kmax;
+    double invK = 1. / Kmax;
     double C = cos(th0) - cos(thf);
     double S = 2 * Kmax - sin(th0) + sin(thf);
     double tmp1 = atan2(C, S);
@@ -178,7 +178,7 @@ bool LRL(double th0, double thf, double Kmax, ls& aux){
         return false;
 
     double invK = 1 / Kmax;
-    double C = cos(th0) - cos(thf);
+    double C = cos(thf) - cos(th0);
     double S = 2 * Kmax + sin(th0) - sin(thf);
     double tmp1 = atan2(C, S);
     aux.s2 = invK * mod2pi(2 * M_PI - acos(tmp2));

@@ -81,7 +81,7 @@ coordinating::triplet_t coordinating::coordinate(const coordinating::sampling_t&
             else r1_r2_ok = true;
         }
         while(!r2_r3_ok){
-            if (std::any_of(std::execution::par_unseq, collisions_1_2.begin(), collisions_1_2.end(), [&](const auto& c){
+            if (std::any_of(std::execution::par_unseq, collisions_2_3.begin(), collisions_2_3.end(), [&](const auto& c){
                 return same_time(c, wait_t2, wait_t3, 2 * robot_r, safety_off);
             })){
                 wait_t3 += wait_time;
@@ -90,7 +90,7 @@ coordinating::triplet_t coordinating::coordinate(const coordinating::sampling_t&
             else r2_r3_ok = true;
         }
         while(!r1_r3_ok){
-            if (std::any_of(std::execution::par_unseq, collisions_1_2.begin(), collisions_1_2.end(), [&](const auto& c){
+            if (std::any_of(std::execution::par_unseq, collisions_1_3.begin(), collisions_1_3.end(), [&](const auto& c){
                 return same_time(c, wait_t1, wait_t3, 2 * robot_r, safety_off);
             })){
                 wait_t3 += wait_time;
