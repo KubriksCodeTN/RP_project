@@ -12,8 +12,8 @@ using namespace dubins;
  * @param th0 starting angle at point v[0]
  * @param thf arriving angle for point v[-1]
  * @param Kmax maximum curvature
- * @param k number of refinement cycles
- * @param m number of angle intervals per cycle
+ * @param k number of angle intervals per cycle
+ * @param m  number of refinement cycles
  * @return the optimal path
  * 
  * @note for more info see this paper: "An Iterative Dynamic Programming Approach to the Multipoint Markov-Dubins Problem"

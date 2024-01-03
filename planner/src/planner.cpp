@@ -138,7 +138,7 @@ inline double get_yaw(const auto& orientation){
  * 
  * @todo debug
  */
-nav_msgs::msg::Path Planner::get_path_msg(const Clipper2Lib::PathD& fpath){
+nav_msgs::msg::Path Planner::get_path_msg(const Clipper2Lib::PathD& fpath, const std::vector<double>& ths){
     nav_msgs::msg::Path path;
     path.header.stamp = this->get_clock()->now();
     path.header.frame_id = "map";
@@ -150,10 +150,20 @@ nav_msgs::msg::Path Planner::get_path_msg(const Clipper2Lib::PathD& fpath){
         poses_tmp[i].pose.position.y = fpath[i].y;
         poses_tmp[i].pose.position.z = 0;
 
+        tf2::Quaternion quaternion;
+        quaternion.setRPY(0, 0, ths[i]);
+        quaternion.normalize();
+        poses_tmp[i].pose.orientation.x = quaternion.getX();
+        poses_tmp[i].pose.orientation.y = quaternion.getY();
+        poses_tmp[i].pose.orientation.z = quaternion.getZ();
+        poses_tmp[i].pose.orientation.w = quaternion.getW();
+
+        /*
         poses_tmp[i].pose.orientation.x = 0;
         poses_tmp[i].pose.orientation.y = 0;
         poses_tmp[i].pose.orientation.z = 0;
         poses_tmp[i].pose.orientation.w = 0;
+        */
 
         poses_tmp[i].header.stamp = this->get_clock()->now();
         poses_tmp[i].header.frame_id = "base_link";
@@ -290,10 +300,6 @@ void Planner::sub2_callback(geometry_msgs::msg::PoseWithCovarianceStamped msg){
  * @param p path to sample
  * @param l length of the segments to sample (except for the last one of each arc due to remainder)
  * @return the sampled points, and the length of the path from the start to that point
- * 
- * @note s_curves and e_curves are here in case we find a good sampling way for intermediate points
- * in the first and last trait 
- */
 coordinating::sampling_t sample_path(const multi_dubins::path_t& p, double l){
     static constexpr double e = 1e-6;
 
@@ -338,8 +344,51 @@ coordinating::sampling_t sample_path(const multi_dubins::path_t& p, double l){
         curr_l += p[i].a3.L;
     }
 
-    if (out.back() != Clipper2Lib::PointD(p.back().a3.xf, p.back().a3.yf))
+    if (out.back() != Clipper2Lib::PointD(p.back().a3.xf, p.back().a3.yf)){
         out.emplace_back(p.back().a3.xf, p.back().a3.yf);
+        ls.push_back(curr_l);
+    }
+    return { out, ls };
+}
+*/
+
+/**
+ * @brief since nav2 is totally random and unpredictable we have to do it like this (??)
+ */
+coordinating::sampling_t sample_path(const multi_dubins::path_t& p, double l, auto& ths){
+    // static constexpr double e = 1e-6;
+    double at = 0;
+    double curr = 0;
+
+    Clipper2Lib::PathD out;
+    // std::vector<double> ths;
+    std::vector<double> ls;
+    auto mod2pi = [](double th){ return th - M_2_PI * floor(th / M_2_PI); };
+
+    /* this is garbage but at least is somewhat cache friendly */
+    std::vector<const dubins::d_arc*> v(p.size() * 3);
+    for (size_t i = 0; i < p.size(); ++i){
+        v[i * 3] = &p[i].a1;
+        v[i * 3 + 1] = &p[i].a2;
+        v[i * 3 + 2] = &p[i].a3;
+    }
+
+    for (size_t i = 0; i < v.size(); ++i){
+        while (curr < v[i]->L){
+            out.push_back(circline(v[i]->x0, v[i]->y0, v[i]->th0, curr, v[i]->k));
+            ths.push_back(mod2pi(v[i]->th0 + v[i]->k * curr));
+            ls.push_back(at);
+            curr += l;
+            at += l;
+        }
+        curr -= v[i]->L;
+    }
+
+    if (out.back() != Clipper2Lib::PointD(p.back().a3.xf, p.back().a3.yf)){
+        out.emplace_back(p.back().a3.xf, p.back().a3.yf);
+        ls.push_back(at - l + curr);
+    }
+
     return { out, ls };
 }
 
@@ -350,7 +399,6 @@ coordinating::sampling_t sample_path(const multi_dubins::path_t& p, double l){
  * 
  * @note under the assumption of rectangles as borders we could use RectClip which is more efficient 
  * but sadly this is not the case
- * @todo test and, if we find a good sampling heuristic, try to clip multiple curves at once for optimization
  */
 bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env){
     static constexpr double e = 1e-6;
@@ -393,7 +441,7 @@ dubins::d_curve Planner::sample_curve(VisiLibity::Point a, double th0, VisiLibit
     auto paths = dubins::d_paths(a.x(), a.y(), th0, b.x(), b.y(), thf, Kmax);
 
     for (const auto& c : paths){
-        // std::cout << c.a3.xf << " " << c.a3.yf << '\n';
+        // dubins_dump(paths);
         if (is_collision_free(c, min_env_)) return c;
     }
 
@@ -466,7 +514,7 @@ multi_dubins::path_t Planner::dubins_path(const VisiLibity::Polyline& path, doub
         return { sample_curve(path[0], th0, path[1], thf, 1. / min_r) };
     case 3:
         // note th as intermediate angle might not always be the best but it looks like 
-        // a decent choice for O(1) time algorithm
+        // a decent choice for a O(1) time algorithm
         th = atan2(path[2].y() - path[1].y(), path[2].x() - path[1].x());
         return { 
             sample_curve(path[0], th0, path[1], th, 1. / min_r),
@@ -560,6 +608,7 @@ void Planner::plan(){
     // insert (in a parallel way) the obstacles
     std::transform(std::execution::par_unseq, obstacles_msg_.obstacles.begin(), obstacles_msg_.obstacles.end(), 
         clipper_obs.begin(), [](const auto& ob){
+        /*
         // Can't wait for c++26 to allow constexpr cmath functions (:
         constexpr double sec30 = 1.1547005383792515290182975610039149112952035025402537520372046529;
         constexpr double cos60 = .5;
@@ -580,22 +629,21 @@ void Planner::plan(){
                 {xc + r * sec30 * cos60, yc + r * sec30 * sin60}
             });
         }
+        */
 
-        /*
-        // circles are approximated to hexagons
+        // circles are approximated to squares
         if (ob.radius){
             const double r = ob.radius;
             const double xc = ob.polygon.points[0].x;
             const double yc = ob.polygon.points[0].y;
-            // closed solution for the hexagon
+            // closed solution for the square
             return Clipper2Lib::PathD({
-                {xc + r, yc + r},
-                {xc - r, yc + r},
                 {xc - r, yc - r},
+                {xc - r, yc + r},
+                {xc + r, yc + r},
                 {xc + r, yc - r},
             });
         }
-        */
 
         Clipper2Lib::PathD polygon(ob.polygon.points.size());
         for (auto i = 0UL; i < ob.polygon.points.size(); ++i)
@@ -603,6 +651,7 @@ void Planner::plan(){
         return polygon;
     });
     
+    desmos_dump(clipper_border);
     desmos_dump(clipper_obs);
 
     // get the offsetted enviroment + a minimum offset version of the obstacles used for collision detection when needed
@@ -649,25 +698,26 @@ void Planner::plan(){
     /*
      * NOTE: this could easily be done by three separated threads but idk if the libraries are thread safe
      */
-    p0 = dubins_path(short_p0, th0, thg, min_r);
-    p1 = dubins_path(short_p1, th1, thg, min_r);
-    p2 = dubins_path(short_p2, th2, thg, min_r);
+    p0 = dubins_path(short_p0, th0, thg, inv_k);
+    p1 = dubins_path(short_p1, th1, thg, inv_k);
+    p2 = dubins_path(short_p2, th2, thg, inv_k);
     
     dubins_dump(p0);
     dubins_dump(p1);
     dubins_dump(p2);
 
-    const double l = .3; // good enough?
+    const double l = .25; // good enough?
+    std::vector<double> ths0, ths1, ths2;
     // int32_t s0, e0, s1, e1, s2, e2;
-    auto s_plus_l0 = sample_path(p0, l);
-    auto s_plus_l1 = sample_path(p1, l);
-    auto s_plus_l2 = sample_path(p2, l);
+    auto s_plus_l0 = sample_path(p0, l, ths0);
+    auto s_plus_l1 = sample_path(p1, l, ths1);
+    auto s_plus_l2 = sample_path(p2, l, ths2);
     // handy tuple unpack feature from c++17
     const auto& [samples0, ls0] = s_plus_l0;
     const auto& [samples1, ls1] = s_plus_l1;
     const auto& [samples2, ls2] = s_plus_l2;
 
-    auto path_msg0 = get_path_msg(samples0);
+    auto path_msg0 = get_path_msg(samples0, ths0);
     pub0_->publish(path_msg0);
     if (!client0_->wait_for_action_server()){
         RCLCPP_ERROR(this->get_logger(), "Failed to wait for nav2 server!\n");
@@ -680,7 +730,7 @@ void Planner::plan(){
     follow_msg0.controller_id = "FollowPath";
     client0_->async_send_goal(follow_msg0);
 
-    auto path_msg2 = get_path_msg(samples2);
+    auto path_msg2 = get_path_msg(samples2, ths2);
     pub2_->publish(path_msg2);
     
     if (!client2_->wait_for_action_server()){
@@ -700,6 +750,10 @@ void Planner::plan(){
     for (const auto& p : samples0)
         std::cout << "(" << p.x << ", " << p.y << ")\n";
     std::cout << "-----------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : ths0)
+        std::cout << p << "\n";
+    std::cout << "-----------------------------------------------------\n";
     std::cout << path_msg0.poses.size() << '\n';
     std::cout << "-----------------------------------------------------\n";
     for (const auto& p : path_msg0.poses)
@@ -709,6 +763,10 @@ void Planner::plan(){
     std::cout << "-----------------------------------------------------\n";
     for (const auto& p : samples2)
         std::cout << "(" << p.x << ", " << p.y << ")\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : ths2)
+        std::cout << p << "\n";
     std::cout << "-----------------------------------------------------\n";
     std::cout << path_msg2.poses.size() << '\n';
     std::cout << "-----------------------------------------------------\n";
