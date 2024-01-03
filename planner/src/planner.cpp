@@ -1,5 +1,6 @@
 #include "planner.hpp"
 
+#include <random>
 #include <functional>
 #include <chrono>
 #include <cmath>
@@ -7,6 +8,7 @@
 
 using std::placeholders::_1;
 namespace srv = std::ranges::views;
+using namespace std::literals::chrono_literals;
 
 #define __DEBUG
 #ifdef __DEBUG
@@ -353,7 +355,7 @@ coordinating::sampling_t sample_path(const multi_dubins::path_t& p, double l){
 */
 
 /**
- * @brief since nav2 is totally random and unpredictable we have to do it like this (??)
+ * @brief since nav2 behaves weird sometimes we need to sample evenly
  */
 coordinating::sampling_t sample_path(const multi_dubins::path_t& p, double l, auto& ths){
     // static constexpr double e = 1e-6;
@@ -496,6 +498,7 @@ dubins::d_curve Planner::get_safe_curve(VisiLibity::Point a, VisiLibity::Point b
     // this is slower than actually creating the curve manually
     [[maybe_unused]] auto ok = dubins::d_shortest(a.x(), a.y(), th0, xf, yf, thf, 1. / r, curve);
 #ifdef __DEBUG
+    // dubins_dump(multi_dubins::path_t{{ curve }});
     assert(ok != -1); // should be fine (by construction)
     assert(curve.a1.x0 - curve.a2.x0 < 1e-12 && curve.a1.y0 - curve.a2.y0 < 1e-12); // the epsilon is actually needed
 #endif
@@ -633,7 +636,7 @@ void Planner::plan(){
 
         // circles are approximated to squares
         if (ob.radius){
-            const double r = ob.radius;
+            const double r = ob.radius +0.05;
             const double xc = ob.polygon.points[0].x;
             const double yc = ob.polygon.points[0].y;
             // closed solution for the square
@@ -674,8 +677,9 @@ void Planner::plan(){
 
     // visibility graph
     VisiLibity::Visibility_Graph g(env_, e);
-    // NOTE: it is assumed that the center of the robot is at least .5m from the obstacles for this to work properly
-    // this should be a reasonable request as the robot ha a radius of ~.4m (.35 + .05 for safety) 
+    // NOTE: it is assumed that the center of the robot at the start is at least .55m from the obstacles for this to work properly
+    // this should be a reasonable request as the robot ha a radius of ~.4m (.35 + .05 for safety) and if the obstacle is in front
+    // of him he can't even turn back (too close) 
     // (it might still work even if this is not satisfied)
     /*
     // to check if it's really ok use this: (the gate should always be fine)
@@ -717,6 +721,7 @@ void Planner::plan(){
     const auto& [samples1, ls1] = s_plus_l1;
     const auto& [samples2, ls2] = s_plus_l2;
 
+    // TODO create a function
     auto path_msg0 = get_path_msg(samples0, ths0);
     pub0_->publish(path_msg0);
     if (!client0_->wait_for_action_server()){
@@ -730,15 +735,26 @@ void Planner::plan(){
     follow_msg0.controller_id = "FollowPath";
     client0_->async_send_goal(follow_msg0);
 
+    auto path_msg1 = get_path_msg(samples1, ths1);
+    pub1_->publish(path_msg1);
+    if (!client1_->wait_for_action_server()){
+        RCLCPP_ERROR(this->get_logger(), "Failed to wait for nav2 server!\n");
+        rclcpp::shutdown();
+        exit(1);
+    }
+    // TODO better future handling using callbacks (the node should be spinning in the executor)
+    auto follow_msg1 = nav2_msgs::action::FollowPath::Goal();
+    follow_msg1.path = path_msg1;
+    follow_msg1.controller_id = "FollowPath";
+    client1_->async_send_goal(follow_msg1);
+
     auto path_msg2 = get_path_msg(samples2, ths2);
     pub2_->publish(path_msg2);
-    
     if (!client2_->wait_for_action_server()){
         RCLCPP_ERROR(this->get_logger(), "Failed to wait for nav2 server!\n");
         rclcpp::shutdown();
         exit(1);
     }
-
     // TODO better future handling using callbacks (the node should be spinning in the executor)
     auto follow_msg2 = nav2_msgs::action::FollowPath::Goal();
     follow_msg2.path = path_msg2;
@@ -757,6 +773,20 @@ void Planner::plan(){
     std::cout << path_msg0.poses.size() << '\n';
     std::cout << "-----------------------------------------------------\n";
     for (const auto& p : path_msg0.poses)
+        std::cout << "(" << p.pose.position.x << ", " << p.pose.position.y << ")\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : samples1)
+        std::cout << "(" << p.x << ", " << p.y << ")\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : ths1)
+        std::cout << p << "\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << path_msg1.poses.size() << '\n';
+    std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : path_msg1.poses)
         std::cout << "(" << p.pose.position.x << ", " << p.pose.position.y << ")\n";
     std::cout << "-----------------------------------------------------\n";
     std::cout << "-----------------------------------------------------\n";
@@ -793,18 +823,25 @@ void Planner::plan(){
 
 /*
 void Planner::test(){
-    Clipper2Lib::PathsD env{{{-4.75, -8.21875}, {-9.49219, 0.}, {-4.75, 8.21875}, {-2.15625, 8.21875}, {-2.35938, 7.86719}, {-1.60156, 6.54688}, {-0.0703125, 6.54688}, {0.6875, 7.86719}, {0.484375, 8.21875}, {4.75, 8.21875}, {9.49219, 0.}, {4.75, -8.21875}},
-    {{0.0078125, 2.89844}, {0.65625, 4.02344}, {0.0078125, 5.14062}, {-1.28906, 5.14062}, {-1.9375, 4.02344}, {-1.28906, 2.89844}}, {{4.4375, -0.921875}, {5.20312, 0.398438}, {4.4375, 1.72656}, {2.90625, 1.72656}, {2.14062, 0.398438}, {2.90625, -0.921875}},
-    {{1.92969, -2.17969}, {2.5, -1.17969}, {1.92969, -0.1875}, {0.78125, -0.1875}, {0.203125, -1.17969}, {0.78125, -2.17969}},
-    {{-1.78906, -4.52344}, {-1.14844, -3.42188}, {-1.78906, -2.32812}, {-3.04688, -2.32812}, {-3.67969, -3.42188}, {-3.04688, -4.52344}}};
+    std::mt19937 mt;
+    std::uniform_real_distribution<> dist(-10., 10.);
+    VisiLibity::Point a, b, c, new_a, r;
 
-    min_env_ = env;
+while(1){
+    a.set_x(dist(mt) + .5);
+    a.set_y(dist(mt) + .5);
+    b.set_x(dist(mt) - .5);
+    b.set_y(dist(mt) - .5);
+    c.set_x(dist(mt) - .5);
+    c.set_y(dist(mt) + .5);
 
-    VisiLibity::Polyline p;
-    p.push_back(VisiLibity::Point(9.89677e-06, -1.67682e-13));
-    p.push_back(VisiLibity::Point(0.140625, -1.17969));
-    p.push_back(VisiLibity::Point(1.19044, -8.16015));
-    auto ph = dubins_path(p, 0, -M_PI / 2., min_r);
-    dubins_dump(ph);
+    std::cout << "A = (" << a.x() << ", " << a.y() << ")\n";
+    std::cout << "B = (" << b.x() << ", " << b.y() << ")\n";
+    std::cout << "C = (" << c.x() << ", " << c.y() << ")\n";
+    std::cout << "polygon(A, B)\n";
+    std::cout << "polygon(C, B)\n";
+
+    get_safe_curve(a, b, c, new_a, .5);
+}
 }
 */
