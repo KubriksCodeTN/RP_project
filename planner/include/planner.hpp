@@ -74,7 +74,7 @@ class Planner : public rclcpp::Node{
 
     protected:
         dubins::d_curve get_safe_curve(VisiLibity::Point, VisiLibity::Point, VisiLibity::Point, VisiLibity::Point&, double);
-        dubins::d_curve sample_curve(VisiLibity::Point, double, VisiLibity::Point, double, double);
+        multi_dubins::path_t sample_curve(VisiLibity::Point, double, VisiLibity::Point, double, double);
         nav_msgs::msg::Path get_path_msg(const Clipper2Lib::PathD&, const std::vector<double>&);
         
     public:

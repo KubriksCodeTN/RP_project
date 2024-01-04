@@ -425,8 +425,9 @@ bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env)
 }
 
 /**
- * @brief get a safe (collision free) dubins curve to go from a to b using clipper2, if not found
- * just shutdown, error handling is pretty useless at this point (there's no path anyway)
+ * @brief get a safe (collision free) dubins curve to go from a to b using clipper2, if not found just
+ * shutdown, error handling is pretty useless at this point (there's no path anyway), if a path from
+ * a to b does not exist the algorithm tries to sample an intermediate point to move from a to it and then to b
  * 
  * @param a starting point
  * @param th0 starting angle
@@ -436,18 +437,54 @@ bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env)
  * @return the safe dubins curve
  * 
  * @note to do this we check for collision every possible dubins path from a to b
- * @todo sample a new point using a decent euristic to find a feasible path like 
- * a -> intermediate_point -> b
+ * @todo debug and maybe try every possible path a -> tmp -> b and get the shortest one
  */
-dubins::d_curve Planner::sample_curve(VisiLibity::Point a, double th0, VisiLibity::Point b, double thf, double Kmax){
+multi_dubins::path_t Planner::sample_curve(VisiLibity::Point a, double th0, VisiLibity::Point b, double thf, double Kmax){
     auto paths = dubins::d_paths(a.x(), a.y(), th0, b.x(), b.y(), thf, Kmax);
 
     for (const auto& c : paths){
         // dubins_dump(paths);
-        if (is_collision_free(c, min_env_)) return c;
+        if (is_collision_free(c, min_env_)) return { c };
     }
 
-    // TODO: sample a good point to try and find a new feasible path
+    // if no path from A to B is found, sample in the 8 directions and try to move to that intermidiate point 
+    // this should happen rarely so no real need to optimize (also is in constant time so) but maybe we can find
+    // the best order in which trying the sampling points?
+#ifdef __DEBUG
+    std::cout << "Sampling intermidiate Point!\n";
+#endif
+    constexpr double cos45 = 0.7071067811865475244008443621048490392848359376884740365883398689;
+    constexpr double sin45 = cos45;
+    const double r[] = { .5, 1.}; // half of d needed?
+    // there might be better choices but for now this has worked fine
+    const double th = atan2(b.y() - a.y(), b.x() - a.x()); 
+
+    for (auto i = 0UL; i < sizeof(r) / sizeof(double); ++i){
+        VisiLibity::Point tmp[] = {
+            VisiLibity::Point(a.x() + r[i], a.y()),
+            VisiLibity::Point(a.x() - r[i], a.y()),
+            VisiLibity::Point(a.x(), a.y() + r[i]),
+            VisiLibity::Point(a.x(), a.y() - r[i]),
+            VisiLibity::Point(a.x() + r[i] * cos45, a.y() + r[i] * sin45),
+            VisiLibity::Point(a.x() - r[i] * cos45, a.y() - r[i] * sin45),
+            VisiLibity::Point(a.x() - r[i] * cos45, a.y() + r[i] * sin45),
+            VisiLibity::Point(a.x() + r[i] * cos45, a.y() - r[i] * sin45),
+        };
+        for (auto j = 0UL; j < sizeof(tmp) / sizeof(VisiLibity::Point); ++j){
+            auto piece1 = dubins::d_paths(a.x(), a.y(), th0, tmp[i].x(), tmp[i].y(), th, Kmax);
+            auto piece2 = dubins::d_paths(tmp[i].x(), tmp[i].y(), th, b.x(), b.y(), thf, Kmax);
+
+            // this could be better (maybe get every possible path and choose the best?)
+            for (const auto& c1 : piece1){
+                if (is_collision_free(c1, min_env_)){
+                    for (const auto& c2 : piece2)
+                        if (is_collision_free(c2, min_env_))
+                            return { c1, c2 };
+                }
+            }
+        }
+    }
+    
     RCLCPP_ERROR(this->get_logger(), "Could not find a feasible path using dubins curves to go from (%lf, %lf) to (%lf, %lf)!\n",
         a.x(), a.y(), b.x(), b.y());
     rclcpp::shutdown();
@@ -512,26 +549,28 @@ dubins::d_curve Planner::get_safe_curve(VisiLibity::Point a, VisiLibity::Point b
  */
 multi_dubins::path_t Planner::dubins_path(const VisiLibity::Polyline& path, double th0, double thf, double r){
     double th;
+    multi_dubins::path_t start;
+    multi_dubins::path_t end;
     switch (path.size()){
     case 2:
-        return { sample_curve(path[0], th0, path[1], thf, 1. / min_r) };
+        return sample_curve(path[0], th0, path[1], thf, 1. / min_r);
     case 3:
         // note th as intermediate angle might not always be the best but it looks like 
         // a decent choice for a O(1) time algorithm
         th = atan2(path[2].y() - path[1].y(), path[2].x() - path[1].x());
-        return { 
-            sample_curve(path[0], th0, path[1], th, 1. / min_r),
-            sample_curve(path[1], th, path[2], thf, 1. / min_r)
-        };
+        start = sample_curve(path[0], th0, path[1], th, 1. / min_r);
+        end = sample_curve(path[1], th, path[2], thf, 1. / min_r);
+        std::ranges::move(end, std::back_insert_iterator(start));
+        return start;
     case 4:
         th = atan2(path[2].y() - path[1].y(), path[2].x() - path[1].x());
         dubins::d_curve safe_curve;
         dubins::d_shortest(path[1].x(), path[1].y(), th, path[2].x(), path[2].y(), th, 1. / min_r, safe_curve);
-        return {
-            sample_curve(path[0], th0, path[1], th, 1. / min_r),
-            safe_curve, // always a straight line, in line with our intermediate curves strategy
-            sample_curve(path[2], th, path[3], thf, 1. / min_r)
-        };
+        start = sample_curve(path[0], th0, path[1], th, 1. / min_r);
+        start.push_back(safe_curve); // always a straight line, in line with our intermediate curves strategy
+        end = sample_curve(path[2], th, path[3], thf, 1. / min_r);
+        std::ranges::move(end, std::back_insert_iterator(start));
+        return start;
     // default:
     }
 
@@ -555,8 +594,12 @@ multi_dubins::path_t Planner::dubins_path(const VisiLibity::Polyline& path, doub
         last_l
     };
     */
-    sol.front() = sample_curve(path[0], th0, path[1], sol[1].a1.th0, 1. / min_r);
-    sol.back() = sample_curve(new_a, sol[sol.size() - 2].a3.thf, path[path.size() - 1], thf, 1. / min_r);
+    start = sample_curve(path[0], th0, path[1], sol[1].a1.th0, 1. / min_r);
+    end = sample_curve(new_a, sol[sol.size() - 2].a3.thf, path[path.size() - 1], thf, 1. / min_r);
+    sol.front() = start[0];
+    if (start.size() > 1)
+        sol.insert(sol.begin() + 1, start[1]);
+    std::ranges::move(end, std::back_insert_iterator(sol));
 
 #ifdef __DEBUG
     std::cout << "------------------------------------------------------------------------------------------\n";
@@ -710,6 +753,7 @@ void Planner::plan(){
     dubins_dump(p1);
     dubins_dump(p2);
 
+    // TODO thread for sample_path and get_path and then coordinate
     const double l = .25; // good enough?
     std::vector<double> ths0, ths1, ths2;
     // int32_t s0, e0, s1, e1, s2, e2;
@@ -723,6 +767,10 @@ void Planner::plan(){
 
     // TODO create a function
     auto path_msg0 = get_path_msg(samples0, ths0);
+    auto path_msg1 = get_path_msg(samples1, ths1);
+    auto path_msg2 = get_path_msg(samples2, ths2);
+
+
     pub0_->publish(path_msg0);
     if (!client0_->wait_for_action_server()){
         RCLCPP_ERROR(this->get_logger(), "Failed to wait for nav2 server!\n");
@@ -734,8 +782,7 @@ void Planner::plan(){
     follow_msg0.path = path_msg0;
     follow_msg0.controller_id = "FollowPath";
     client0_->async_send_goal(follow_msg0);
-
-    auto path_msg1 = get_path_msg(samples1, ths1);
+    
     pub1_->publish(path_msg1);
     if (!client1_->wait_for_action_server()){
         RCLCPP_ERROR(this->get_logger(), "Failed to wait for nav2 server!\n");
@@ -747,8 +794,7 @@ void Planner::plan(){
     follow_msg1.path = path_msg1;
     follow_msg1.controller_id = "FollowPath";
     client1_->async_send_goal(follow_msg1);
-
-    auto path_msg2 = get_path_msg(samples2, ths2);
+    
     pub2_->publish(path_msg2);
     if (!client2_->wait_for_action_server()){
         RCLCPP_ERROR(this->get_logger(), "Failed to wait for nav2 server!\n");
