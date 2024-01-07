@@ -1,5 +1,6 @@
 #include "planner.hpp"
 
+#include <random>
 #include <functional>
 #include <chrono>
 #include <cmath>
@@ -7,6 +8,7 @@
 
 using std::placeholders::_1;
 namespace srv = std::ranges::views;
+using namespace std::literals::chrono_literals;
 
 #define __DEBUG
 #ifdef __DEBUG
@@ -138,7 +140,7 @@ inline double get_yaw(const auto& orientation){
  * 
  * @todo debug
  */
-nav_msgs::msg::Path Planner::get_path_msg(const Clipper2Lib::PathD& fpath){
+nav_msgs::msg::Path Planner::get_path_msg(const Clipper2Lib::PathD& fpath, const std::vector<double>& ths){
     nav_msgs::msg::Path path;
     path.header.stamp = this->get_clock()->now();
     path.header.frame_id = "map";
@@ -150,10 +152,20 @@ nav_msgs::msg::Path Planner::get_path_msg(const Clipper2Lib::PathD& fpath){
         poses_tmp[i].pose.position.y = fpath[i].y;
         poses_tmp[i].pose.position.z = 0;
 
+        tf2::Quaternion quaternion;
+        quaternion.setRPY(0, 0, ths[i]);
+        quaternion.normalize();
+        poses_tmp[i].pose.orientation.x = quaternion.getX();
+        poses_tmp[i].pose.orientation.y = quaternion.getY();
+        poses_tmp[i].pose.orientation.z = quaternion.getZ();
+        poses_tmp[i].pose.orientation.w = quaternion.getW();
+
+        /*
         poses_tmp[i].pose.orientation.x = 0;
         poses_tmp[i].pose.orientation.y = 0;
         poses_tmp[i].pose.orientation.z = 0;
         poses_tmp[i].pose.orientation.w = 0;
+        */
 
         poses_tmp[i].header.stamp = this->get_clock()->now();
         poses_tmp[i].header.frame_id = "base_link";
@@ -290,10 +302,6 @@ void Planner::sub2_callback(geometry_msgs::msg::PoseWithCovarianceStamped msg){
  * @param p path to sample
  * @param l length of the segments to sample (except for the last one of each arc due to remainder)
  * @return the sampled points, and the length of the path from the start to that point
- * 
- * @note s_curves and e_curves are here in case we find a good sampling way for intermediate points
- * in the first and last trait 
- */
 coordinating::sampling_t sample_path(const multi_dubins::path_t& p, double l){
     static constexpr double e = 1e-6;
 
@@ -338,8 +346,51 @@ coordinating::sampling_t sample_path(const multi_dubins::path_t& p, double l){
         curr_l += p[i].a3.L;
     }
 
-    if (out.back() != Clipper2Lib::PointD(p.back().a3.xf, p.back().a3.yf))
+    if (out.back() != Clipper2Lib::PointD(p.back().a3.xf, p.back().a3.yf)){
         out.emplace_back(p.back().a3.xf, p.back().a3.yf);
+        ls.push_back(curr_l);
+    }
+    return { out, ls };
+}
+*/
+
+/**
+ * @brief since nav2 behaves weird sometimes we need to sample evenly
+ */
+coordinating::sampling_t sample_path(const multi_dubins::path_t& p, double l, auto& ths){
+    // static constexpr double e = 1e-6;
+    double at = 0;
+    double curr = 0;
+
+    Clipper2Lib::PathD out;
+    // std::vector<double> ths;
+    std::vector<double> ls;
+    auto mod2pi = [](double th){ return th - M_2_PI * floor(th / M_2_PI); };
+
+    /* this is garbage but at least is somewhat cache friendly */
+    std::vector<const dubins::d_arc*> v(p.size() * 3);
+    for (size_t i = 0; i < p.size(); ++i){
+        v[i * 3] = &p[i].a1;
+        v[i * 3 + 1] = &p[i].a2;
+        v[i * 3 + 2] = &p[i].a3;
+    }
+
+    for (size_t i = 0; i < v.size(); ++i){
+        while (curr < v[i]->L){
+            out.push_back(circline(v[i]->x0, v[i]->y0, v[i]->th0, curr, v[i]->k));
+            ths.push_back(mod2pi(v[i]->th0 + v[i]->k * curr));
+            ls.push_back(at);
+            curr += l;
+            at += l;
+        }
+        curr -= v[i]->L;
+    }
+
+    if (out.back() != Clipper2Lib::PointD(p.back().a3.xf, p.back().a3.yf)){
+        out.emplace_back(p.back().a3.xf, p.back().a3.yf);
+        ls.push_back(at - l + curr);
+    }
+
     return { out, ls };
 }
 
@@ -350,7 +401,6 @@ coordinating::sampling_t sample_path(const multi_dubins::path_t& p, double l){
  * 
  * @note under the assumption of rectangles as borders we could use RectClip which is more efficient 
  * but sadly this is not the case
- * @todo test and, if we find a good sampling heuristic, try to clip multiple curves at once for optimization
  */
 bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env){
     static constexpr double e = 1e-6;
@@ -375,8 +425,9 @@ bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env)
 }
 
 /**
- * @brief get a safe (collision free) dubins curve to go from a to b using clipper2, if not found
- * just shutdown, error handling is pretty useless at this point (there's no path anyway)
+ * @brief get a safe (collision free) dubins curve to go from a to b using clipper2, if not found just
+ * shutdown, error handling is pretty useless at this point (there's no path anyway), if a path from
+ * a to b does not exist the algorithm tries to sample an intermediate point to move from a to it and then to b
  * 
  * @param a starting point
  * @param th0 starting angle
@@ -386,18 +437,54 @@ bool is_collision_free(const dubins::d_curve& c, const Clipper2Lib::PathsD& env)
  * @return the safe dubins curve
  * 
  * @note to do this we check for collision every possible dubins path from a to b
- * @todo sample a new point using a decent euristic to find a feasible path like 
- * a -> intermediate_point -> b
+ * @todo debug and maybe try every possible path a -> tmp -> b and get the shortest one
  */
-dubins::d_curve Planner::sample_curve(VisiLibity::Point a, double th0, VisiLibity::Point b, double thf, double Kmax){
+multi_dubins::path_t Planner::sample_curve(VisiLibity::Point a, double th0, VisiLibity::Point b, double thf, double Kmax){
     auto paths = dubins::d_paths(a.x(), a.y(), th0, b.x(), b.y(), thf, Kmax);
 
     for (const auto& c : paths){
-        // std::cout << c.a3.xf << " " << c.a3.yf << '\n';
-        if (is_collision_free(c, min_env_)) return c;
+        // dubins_dump(paths);
+        if (is_collision_free(c, min_env_)) return { c };
     }
 
-    // TODO: sample a good point to try and find a new feasible path
+    // if no path from A to B is found, sample in the 8 directions and try to move to that intermidiate point 
+    // this should happen rarely so no real need to optimize (also is in constant time so) but maybe we can find
+    // the best order in which trying the sampling points?
+#ifdef __DEBUG
+    std::cout << "Sampling intermidiate Point!\n";
+#endif
+    constexpr double cos45 = 0.7071067811865475244008443621048490392848359376884740365883398689;
+    constexpr double sin45 = cos45;
+    const double r[] = { .5, 1.}; // half of d needed?
+    // there might be better choices but for now this has worked fine
+    const double th = atan2(b.y() - a.y(), b.x() - a.x()); 
+
+    for (auto i = 0UL; i < sizeof(r) / sizeof(double); ++i){
+        VisiLibity::Point tmp[] = {
+            VisiLibity::Point(a.x() + r[i], a.y()),
+            VisiLibity::Point(a.x() - r[i], a.y()),
+            VisiLibity::Point(a.x(), a.y() + r[i]),
+            VisiLibity::Point(a.x(), a.y() - r[i]),
+            VisiLibity::Point(a.x() + r[i] * cos45, a.y() + r[i] * sin45),
+            VisiLibity::Point(a.x() - r[i] * cos45, a.y() - r[i] * sin45),
+            VisiLibity::Point(a.x() - r[i] * cos45, a.y() + r[i] * sin45),
+            VisiLibity::Point(a.x() + r[i] * cos45, a.y() - r[i] * sin45),
+        };
+        for (auto j = 0UL; j < sizeof(tmp) / sizeof(VisiLibity::Point); ++j){
+            auto piece1 = dubins::d_paths(a.x(), a.y(), th0, tmp[i].x(), tmp[i].y(), th, Kmax);
+            auto piece2 = dubins::d_paths(tmp[i].x(), tmp[i].y(), th, b.x(), b.y(), thf, Kmax);
+
+            // this could be better (maybe get every possible path and choose the best?)
+            for (const auto& c1 : piece1){
+                if (is_collision_free(c1, min_env_)){
+                    for (const auto& c2 : piece2)
+                        if (is_collision_free(c2, min_env_))
+                            return { c1, c2 };
+                }
+            }
+        }
+    }
+    
     RCLCPP_ERROR(this->get_logger(), "Could not find a feasible path using dubins curves to go from (%lf, %lf) to (%lf, %lf)!\n",
         a.x(), a.y(), b.x(), b.y());
     rclcpp::shutdown();
@@ -448,6 +535,7 @@ dubins::d_curve Planner::get_safe_curve(VisiLibity::Point a, VisiLibity::Point b
     // this is slower than actually creating the curve manually
     [[maybe_unused]] auto ok = dubins::d_shortest(a.x(), a.y(), th0, xf, yf, thf, 1. / r, curve);
 #ifdef __DEBUG
+    // dubins_dump(multi_dubins::path_t{{ curve }});
     assert(ok != -1); // should be fine (by construction)
     assert(curve.a1.x0 - curve.a2.x0 < 1e-12 && curve.a1.y0 - curve.a2.y0 < 1e-12); // the epsilon is actually needed
 #endif
@@ -456,31 +544,31 @@ dubins::d_curve Planner::get_safe_curve(VisiLibity::Point a, VisiLibity::Point b
 
 /**
  * @brief create the dubins path following the proposed strategies 
- * 
- * @todo angle case 3
  */
 multi_dubins::path_t Planner::dubins_path(const VisiLibity::Polyline& path, double th0, double thf, double r){
     double th;
+    multi_dubins::path_t start;
+    multi_dubins::path_t end;
     switch (path.size()){
     case 2:
-        return { sample_curve(path[0], th0, path[1], thf, 1. / min_r) };
+        return sample_curve(path[0], th0, path[1], thf, 1. / min_r);
     case 3:
         // note th as intermediate angle might not always be the best but it looks like 
-        // a decent choice for O(1) time algorithm
+        // a decent choice for a O(1) time algorithm
         th = atan2(path[2].y() - path[1].y(), path[2].x() - path[1].x());
-        return { 
-            sample_curve(path[0], th0, path[1], th, 1. / min_r),
-            sample_curve(path[1], th, path[2], thf, 1. / min_r)
-        };
+        start = sample_curve(path[0], th0, path[1], th, 1. / min_r);
+        end = sample_curve(path[1], th, path[2], thf, 1. / min_r);
+        std::ranges::move(end, std::back_insert_iterator(start));
+        return start;
     case 4:
         th = atan2(path[2].y() - path[1].y(), path[2].x() - path[1].x());
         dubins::d_curve safe_curve;
         dubins::d_shortest(path[1].x(), path[1].y(), th, path[2].x(), path[2].y(), th, 1. / min_r, safe_curve);
-        return {
-            sample_curve(path[0], th0, path[1], th, 1. / min_r),
-            safe_curve, // always a straight line, in line with our intermediate curves strategy
-            sample_curve(path[2], th, path[3], thf, 1. / min_r)
-        };
+        start = sample_curve(path[0], th0, path[1], th, 1. / min_r);
+        start.push_back(safe_curve); // always a straight line, in line with our intermediate curves strategy
+        end = sample_curve(path[2], th, path[3], thf, 1. / min_r);
+        std::ranges::move(end, std::back_insert_iterator(start));
+        return start;
     // default:
     }
 
@@ -504,8 +592,12 @@ multi_dubins::path_t Planner::dubins_path(const VisiLibity::Polyline& path, doub
         last_l
     };
     */
-    sol.front() = sample_curve(path[0], th0, path[1], sol[1].a1.th0, 1. / min_r);
-    sol.back() = sample_curve(new_a, sol[sol.size() - 2].a3.thf, path[path.size() - 1], thf, 1. / min_r);
+    start = sample_curve(path[0], th0, path[1], sol[1].a1.th0, 1. / min_r);
+    end = sample_curve(new_a, sol[sol.size() - 2].a3.thf, path[path.size() - 1], thf, 1. / min_r);
+    sol.front() = start[0];
+    if (start.size() > 1)
+        sol.insert(sol.begin() + 1, start[1]);
+    std::ranges::move(end, std::back_insert_iterator(sol));
 
 #ifdef __DEBUG
     std::cout << "------------------------------------------------------------------------------------------\n";
@@ -526,7 +618,6 @@ multi_dubins::path_t Planner::dubins_path(const VisiLibity::Polyline& path, doub
  * 
  * @note given that the number of obstacles and points can be rather small, using multithreading might
  * be slower than a sequential execution but it allows better scalability (and gains in perfomance when it matters)
- * @todo check if tinygeom2d is faster than VisiLibity
  */
 void Planner::plan(){
     // chosen epsilon for enviroment check
@@ -560,6 +651,7 @@ void Planner::plan(){
     // insert (in a parallel way) the obstacles
     std::transform(std::execution::par_unseq, obstacles_msg_.obstacles.begin(), obstacles_msg_.obstacles.end(), 
         clipper_obs.begin(), [](const auto& ob){
+        /*
         // Can't wait for c++26 to allow constexpr cmath functions (:
         constexpr double sec30 = 1.1547005383792515290182975610039149112952035025402537520372046529;
         constexpr double cos60 = .5;
@@ -580,22 +672,22 @@ void Planner::plan(){
                 {xc + r * sec30 * cos60, yc + r * sec30 * sin60}
             });
         }
+        */
 
-        /*
-        // circles are approximated to hexagons
+        // circles are approximated to squares
         if (ob.radius){
+            // const double r = ob.radius + 0.05;
             const double r = ob.radius;
             const double xc = ob.polygon.points[0].x;
             const double yc = ob.polygon.points[0].y;
-            // closed solution for the hexagon
+            // closed solution for the square
             return Clipper2Lib::PathD({
-                {xc + r, yc + r},
-                {xc - r, yc + r},
                 {xc - r, yc - r},
+                {xc - r, yc + r},
+                {xc + r, yc + r},
                 {xc + r, yc - r},
             });
         }
-        */
 
         Clipper2Lib::PathD polygon(ob.polygon.points.size());
         for (auto i = 0UL; i < ob.polygon.points.size(); ++i)
@@ -603,6 +695,7 @@ void Planner::plan(){
         return polygon;
     });
     
+    desmos_dump(clipper_border);
     desmos_dump(clipper_obs);
 
     // get the offsetted enviroment + a minimum offset version of the obstacles used for collision detection when needed
@@ -625,11 +718,8 @@ void Planner::plan(){
 
     // visibility graph
     VisiLibity::Visibility_Graph g(env_, e);
-    // NOTE: it is assumed that the center of the robot is at least .5m from the obstacles for this to work properly
-    // this should be a reasonable request as the robot ha a radius of ~.4m (.35 + .05 for safety) 
-    // (it might still work even if this is not satisfied)
     /*
-    // to check if it's really ok use this: (the gate should always be fine)
+    // this should be true for proper work
     robot0.in(env, e);
     robot1.in(env, e);
     robot2.in(env, e);
@@ -649,25 +739,64 @@ void Planner::plan(){
     /*
      * NOTE: this could easily be done by three separated threads but idk if the libraries are thread safe
      */
-    p0 = dubins_path(short_p0, th0, thg, min_r);
-    p1 = dubins_path(short_p1, th1, thg, min_r);
-    p2 = dubins_path(short_p2, th2, thg, min_r);
+    p0 = dubins_path(short_p0, th0, thg, inv_k);
+    p1 = dubins_path(short_p1, th1, thg, inv_k);
+    p2 = dubins_path(short_p2, th2, thg, inv_k);
     
     dubins_dump(p0);
     dubins_dump(p1);
     dubins_dump(p2);
 
-    const double l = .3; // good enough?
+    // TODO thread for sample_path and get_path and then coordinate
+    const double l = .25; // good enough?
+    std::vector<double> ths0, ths1, ths2;
     // int32_t s0, e0, s1, e1, s2, e2;
-    auto s_plus_l0 = sample_path(p0, l);
-    auto s_plus_l1 = sample_path(p1, l);
-    auto s_plus_l2 = sample_path(p2, l);
+    auto s_plus_l0 = sample_path(p0, l, ths0);
+    auto s_plus_l1 = sample_path(p1, l, ths1);
+    auto s_plus_l2 = sample_path(p2, l, ths2);
     // handy tuple unpack feature from c++17
     const auto& [samples0, ls0] = s_plus_l0;
     const auto& [samples1, ls1] = s_plus_l1;
     const auto& [samples2, ls2] = s_plus_l2;
 
-    auto path_msg0 = get_path_msg(samples0);
+    // TODO create a function
+    auto path_msg0 = get_path_msg(samples0, ths0);
+    auto path_msg1 = get_path_msg(samples1, ths1);
+    auto path_msg2 = get_path_msg(samples2, ths2);
+
+    const auto[del0, del1, del2] = coordinating::coordinate(s_plus_l0, s_plus_l1, s_plus_l2, hrobot_sz, 2 * hrobot_sz);
+
+    auto follow_msg0 = nav2_msgs::action::FollowPath::Goal();
+    follow_msg0.path = path_msg0;
+    follow_msg0.controller_id = "FollowPath";
+    auto follow_msg1 = nav2_msgs::action::FollowPath::Goal();
+    follow_msg1.path = path_msg1;
+    follow_msg1.controller_id = "FollowPath";
+    auto follow_msg2 = nav2_msgs::action::FollowPath::Goal();
+    follow_msg2.path = path_msg2;
+    follow_msg2.controller_id = "FollowPath";
+
+    client0_->wait_for_action_server();
+    client1_->wait_for_action_server();
+    client2_->wait_for_action_server();
+
+    // might cause out of sync due to thread startup time?
+    std::jthread run0 = std::jthread([&](){
+        std::this_thread::sleep_for(std::chrono::duration<double>(del0));
+        client0_->async_send_goal(follow_msg0);
+    });
+
+    std::jthread run1 = std::jthread([&](){
+        std::this_thread::sleep_for(std::chrono::duration<double>(del1));
+        client1_->async_send_goal(follow_msg1);
+    });
+
+    std::jthread run2 = std::jthread([&](){
+        std::this_thread::sleep_for(std::chrono::duration<double>(del2));
+        client2_->async_send_goal(follow_msg2);
+    });
+
+    /*
     pub0_->publish(path_msg0);
     if (!client0_->wait_for_action_server()){
         RCLCPP_ERROR(this->get_logger(), "Failed to wait for nav2 server!\n");
@@ -679,26 +808,40 @@ void Planner::plan(){
     follow_msg0.path = path_msg0;
     follow_msg0.controller_id = "FollowPath";
     client0_->async_send_goal(follow_msg0);
-
-    auto path_msg2 = get_path_msg(samples2);
-    pub2_->publish(path_msg2);
     
+    pub1_->publish(path_msg1);
+    if (!client1_->wait_for_action_server()){
+        RCLCPP_ERROR(this->get_logger(), "Failed to wait for nav2 server!\n");
+        rclcpp::shutdown();
+        exit(1);
+    }
+    // TODO better future handling using callbacks (the node should be spinning in the executor)
+    auto follow_msg1 = nav2_msgs::action::FollowPath::Goal();
+    follow_msg1.path = path_msg1;
+    follow_msg1.controller_id = "FollowPath";
+    client1_->async_send_goal(follow_msg1);
+    
+    pub2_->publish(path_msg2);
     if (!client2_->wait_for_action_server()){
         RCLCPP_ERROR(this->get_logger(), "Failed to wait for nav2 server!\n");
         rclcpp::shutdown();
         exit(1);
     }
-
     // TODO better future handling using callbacks (the node should be spinning in the executor)
     auto follow_msg2 = nav2_msgs::action::FollowPath::Goal();
     follow_msg2.path = path_msg2;
     follow_msg2.controller_id = "FollowPath";
     client2_->async_send_goal(follow_msg2);
+    */
 
 #ifdef __DEBUG
     std::cout << "-----------------------------------------------------\n";
     for (const auto& p : samples0)
         std::cout << "(" << p.x << ", " << p.y << ")\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : ls0)
+        std::cout << p << "\n";
     std::cout << "-----------------------------------------------------\n";
     std::cout << path_msg0.poses.size() << '\n';
     std::cout << "-----------------------------------------------------\n";
@@ -707,46 +850,49 @@ void Planner::plan(){
     std::cout << "-----------------------------------------------------\n";
     std::cout << "-----------------------------------------------------\n";
     std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : samples1)
+        std::cout << "(" << p.x << ", " << p.y << ")\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : ls1)
+        std::cout << p << "\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << path_msg1.poses.size() << '\n';
+    std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : path_msg1.poses)
+        std::cout << "(" << p.pose.position.x << ", " << p.pose.position.y << ")\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------\n";
     for (const auto& p : samples2)
         std::cout << "(" << p.x << ", " << p.y << ")\n";
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------\n";
+    for (const auto& p : ls2)
+        std::cout << p << "\n";
     std::cout << "-----------------------------------------------------\n";
     std::cout << path_msg2.poses.size() << '\n';
     std::cout << "-----------------------------------------------------\n";
     for (const auto& p : path_msg2.poses)
         std::cout << "(" << p.pose.position.x << ", " << p.pose.position.y << ")\n";
     std::cout << "-----------------------------------------------------\n";
-/*
-    for (const auto& v : samples1)
-        for (const auto& p : v)
-            std::cout << "(" << p.x << ", " << p.y << ")\n";
-
-    for (const auto l : ls1)
-        std::cout << l << '\n';
-
-    for (const auto& v : samples2)
-        for (const auto& p : v)
-            std::cout << "(" << p.x << ", " << p.y << ")\n";
-    
-    for (const auto l : ls2)
-        std::cout << l << '\n';
-*/
 #endif
 }
 
 /*
 void Planner::test(){
-    Clipper2Lib::PathsD env{{{-4.75, -8.21875}, {-9.49219, 0.}, {-4.75, 8.21875}, {-2.15625, 8.21875}, {-2.35938, 7.86719}, {-1.60156, 6.54688}, {-0.0703125, 6.54688}, {0.6875, 7.86719}, {0.484375, 8.21875}, {4.75, 8.21875}, {9.49219, 0.}, {4.75, -8.21875}},
-    {{0.0078125, 2.89844}, {0.65625, 4.02344}, {0.0078125, 5.14062}, {-1.28906, 5.14062}, {-1.9375, 4.02344}, {-1.28906, 2.89844}}, {{4.4375, -0.921875}, {5.20312, 0.398438}, {4.4375, 1.72656}, {2.90625, 1.72656}, {2.14062, 0.398438}, {2.90625, -0.921875}},
-    {{1.92969, -2.17969}, {2.5, -1.17969}, {1.92969, -0.1875}, {0.78125, -0.1875}, {0.203125, -1.17969}, {0.78125, -2.17969}},
-    {{-1.78906, -4.52344}, {-1.14844, -3.42188}, {-1.78906, -2.32812}, {-3.04688, -2.32812}, {-3.67969, -3.42188}, {-3.04688, -4.52344}}};
-
-    min_env_ = env;
-
     VisiLibity::Polyline p;
-    p.push_back(VisiLibity::Point(9.89677e-06, -1.67682e-13));
-    p.push_back(VisiLibity::Point(0.140625, -1.17969));
-    p.push_back(VisiLibity::Point(1.19044, -8.16015));
-    auto ph = dubins_path(p, 0, -M_PI / 2., min_r);
-    dubins_dump(ph);
+    p.push_back(VisiLibity::Point(1.72144e-05, 5));
+    p.push_back(VisiLibity::Point(0.148438, 4.10156));
+    p.push_back(VisiLibity::Point(1.42188, 1.92188));
+    p.push_back(VisiLibity::Point(1.42188, -1.07031));
+    p.push_back(VisiLibity::Point(1.23592, -8.16015));
+    VisiLibity::Point a;
+
+    auto c = get_safe_curve(VisiLibity::Point(0.148438, 4.10156), VisiLibity::Point(1.42188, 1.92188), 
+        VisiLibity::Point(1.42188, -1.07031), a, inv_k);
+    auto c1 = get_safe_curve(a, VisiLibity::Point(1.42188, -1.07031), VisiLibity::Point(1.23592, -8.16015), a, inv_k);
+
+    dubins_dump(multi_dubins::path_t{c, c1});
 }
 */
