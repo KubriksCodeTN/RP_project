@@ -455,9 +455,8 @@ multi_dubins::path_t Planner::sample_curve(VisiLibity::Point a, double th0, Visi
 #endif
     constexpr double cos45 = 0.7071067811865475244008443621048490392848359376884740365883398689;
     constexpr double sin45 = cos45;
-    const double r[] = { .5, 1.}; // half of d needed?
-    // there might be better choices but for now this has worked fine
-    const double th = atan2(b.y() - a.y(), b.x() - a.x()); 
+    const double d = sqrt((a.x() - b.x()) * (a.x() - b.x()) +  (a.y() - b.y()) * (a.y() - b.y()));
+    const double r[] = { .5, .75, 1., 1.25, 2., 2.5, 3., d / 2. }; // half of d needed?
 
     for (auto i = 0UL; i < sizeof(r) / sizeof(double); ++i){
         VisiLibity::Point tmp[] = {
@@ -469,17 +468,21 @@ multi_dubins::path_t Planner::sample_curve(VisiLibity::Point a, double th0, Visi
             VisiLibity::Point(a.x() - r[i] * cos45, a.y() - r[i] * sin45),
             VisiLibity::Point(a.x() - r[i] * cos45, a.y() + r[i] * sin45),
             VisiLibity::Point(a.x() + r[i] * cos45, a.y() - r[i] * sin45),
+            VisiLibity::Point(a.x() + r[i] * cos(th0), a.y() - r[i] * sin(th0)), // a stright line might work
         };
         for (auto j = 0UL; j < sizeof(tmp) / sizeof(VisiLibity::Point); ++j){
-            auto piece1 = dubins::d_paths(a.x(), a.y(), th0, tmp[i].x(), tmp[i].y(), th, Kmax);
-            auto piece2 = dubins::d_paths(tmp[i].x(), tmp[i].y(), th, b.x(), b.y(), thf, Kmax);
+            double th[] = { atan2(tmp[j].y() - a.y(), tmp[j].x() - a.x()), atan2(b.y() - tmp[j].y(), b.x() - tmp[j].x()), th0, thf};
+            for (auto k = 0UL; k < sizeof(th) / sizeof(double); ++k){
+                auto piece1 = dubins::d_paths(a.x(), a.y(), th0, tmp[j].x(), tmp[j].y(), th[k], Kmax);
+                auto piece2 = dubins::d_paths(tmp[j].x(), tmp[j].y(), th[k], b.x(), b.y(), thf, Kmax);
 
-            // this could be better (maybe get every possible path and choose the best?)
-            for (const auto& c1 : piece1){
-                if (is_collision_free(c1, min_env_)){
-                    for (const auto& c2 : piece2)
-                        if (is_collision_free(c2, min_env_))
-                            return { c1, c2 };
+                // maybe get every possible path and choose the best?
+                for (const auto& c1 : piece1){
+                    if (is_collision_free(c1, min_env_)){
+                        for (const auto& c2 : piece2)
+                            if (is_collision_free(c2, min_env_))
+                                return { c1, c2 };
+                    }
                 }
             }
         }
@@ -747,24 +750,43 @@ void Planner::plan(){
     dubins_dump(p1);
     dubins_dump(p2);
 
-    // TODO thread for sample_path and get_path and then coordinate
     const double l = .25; // good enough?
+    // in an effort to stop nav2 from going out of the path we sampled also the angles (maybe it's useless)
     std::vector<double> ths0, ths1, ths2;
     // int32_t s0, e0, s1, e1, s2, e2;
-    auto s_plus_l0 = sample_path(p0, l, ths0);
-    auto s_plus_l1 = sample_path(p1, l, ths1);
-    auto s_plus_l2 = sample_path(p2, l, ths2);
-    // handy tuple unpack feature from c++17
-    const auto& [samples0, ls0] = s_plus_l0;
-    const auto& [samples1, ls1] = s_plus_l1;
-    const auto& [samples2, ls2] = s_plus_l2;
+    coordinating::sampling_t s_plus_l0; 
+    coordinating::sampling_t s_plus_l1; 
+    coordinating::sampling_t s_plus_l2;
+    nav_msgs::msg::Path path_msg0;
+    nav_msgs::msg::Path path_msg1;
+    nav_msgs::msg::Path path_msg2;
 
-    // TODO create a function
-    auto path_msg0 = get_path_msg(samples0, ths0);
-    auto path_msg1 = get_path_msg(samples1, ths1);
-    auto path_msg2 = get_path_msg(samples2, ths2);
+    // exploit parallelism
+    std::thread t0([&](){
+        s_plus_l0 = sample_path(p0, l, ths0);
+        const auto& [samples0, ls0] = s_plus_l0;
+        path_msg0 = get_path_msg(samples0, ths0);
+    });
+    std::thread t1([&](){
+        s_plus_l1 = sample_path(p1, l, ths1);
+        const auto& [samples1, ls1] = s_plus_l1;
+        path_msg1 = get_path_msg(samples1, ths1);
+    });
+    std::thread t2([&](){
+        s_plus_l2 = sample_path(p2, l, ths2);
+        const auto& [samples2, ls2] = s_plus_l2;
+        path_msg2 = get_path_msg(samples2, ths2);
+    });
 
+    t0.join();
+    t1.join();
+    t2.join();
+    
     const auto[del0, del1, del2] = coordinating::coordinate(s_plus_l0, s_plus_l1, s_plus_l2, hrobot_sz, 2 * hrobot_sz);
+
+    pub0_->publish(path_msg0);
+    pub1_->publish(path_msg1);
+    pub2_->publish(path_msg2);
 
     auto follow_msg0 = nav2_msgs::action::FollowPath::Goal();
     follow_msg0.path = path_msg0;
@@ -835,6 +857,11 @@ void Planner::plan(){
     */
 
 #ifdef __DEBUG
+    // handy tuple unpack feature from c++17
+    const auto& [samples0, ls0] = s_plus_l0;
+    const auto& [samples1, ls1] = s_plus_l1;
+    const auto& [samples2, ls2] = s_plus_l2;
+
     std::cout << "-----------------------------------------------------\n";
     for (const auto& p : samples0)
         std::cout << "(" << p.x << ", " << p.y << ")\n";

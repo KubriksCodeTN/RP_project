@@ -79,9 +79,9 @@ class Planner : public rclcpp::Node{
         
     public:
         // robot constraints
-        static inline constexpr double min_r = .55;
+        static inline constexpr double min_r = .52;
         static inline constexpr double inv_k = .5;
-        static inline constexpr double hrobot_sz = .45;
+        static inline constexpr double hrobot_sz = .4;
         // static inline constexpr double velocity = x; // not needed?
 
         Planner();
