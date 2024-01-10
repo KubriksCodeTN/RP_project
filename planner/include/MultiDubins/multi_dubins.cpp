@@ -13,14 +13,14 @@ using namespace dubins;
  * @param thf arriving angle for point v[-1]
  * @param Kmax maximum curvature
  * @param k number of angle intervals per cycle
- * @param m  number of refinement cycles
+ * @param m number of refinement cycles
  * @return the optimal path
  * 
  * @note for more info see this paper: "An Iterative Dynamic Programming Approach to the Multipoint Markov-Dubins Problem"
  * @todo __maybe__ remove the goto
  */
 path_t multi_dubins::dp_dubins(const vector<point_t>& v, double th0, double thf, double Kmax, uint32_t k, uint32_t m){
-    static BS::thread_pool_light pool(std::min(v.size() - 1, std::thread::hardware_concurrency() - 1UL));
+    BS::thread_pool_light pool(std::min(v.size() - 1, std::thread::hardware_concurrency() - 1UL));
     vector<d_curve> ret(v.size() - 1);
 
     double oldh = 2 * M_PI;
